@@ -202,8 +202,27 @@ for label, jf, jobs, shape, hits in selected:
         continue
     try:
         target = params["value"]
+        hit_ids = {str(j.get("id")) for j in hits}
+        if params.get("dry_run"):
+            jobs_now, hits_now = jobs, hits  # 干跑用 pass-1 快照即可
+        else:
+            # 锁内重读:pass-1 的快照可能已被 gateway 更新过(next_run_at/增删作业)
+            try:
+                jobs_now, _shape_now = load(jf)
+            except Exception as e:
+                result["errors"].append("%s: reload fail %s" % (label, e))
+                continue  # finally 仍解锁
+            hits_now = [j for j in jobs_now if isinstance(j, dict)
+                        and str(j.get("id")) in hit_ids]
+            gone = hit_ids - {str(j.get("id")) for j in hits_now}
+            if gone:
+                result["warnings"].append(
+                    "%s: %d 个作业在加锁前已被移除: %s" % (label, len(gone), ",".join(sorted(gone))))
+            if not hits_now:
+                result["skipped"].append("%s: 匹配作业已不存在" % label)
+                continue
         to_write = False
-        for j in hits:
+        for j in hits_now:
             old = j.get("attach_to_session")
             result["changed"].append({"home": label, "id": j.get("id"),
                                       "name": j.get("name"),
@@ -214,16 +233,16 @@ for label, jf, jobs, shape, hits in selected:
                     to_write = True
         if params.get("dry_run") or not to_write:
             continue  # finally 仍解锁
-        payload = jobs if shape == "list" else None
+        payload = jobs_now if shape == "list" else None
         if shape == "dict":
             with open(jf, encoding="utf-8-sig") as f:
                 orig = json.load(f)
             if isinstance(orig, dict):
                 if isinstance(orig.get("jobs"), dict):
                     # jobs 原本是 dict:按 id 键回写,保持 schema 不变
-                    orig["jobs"] = {str(j.get("id")): j for j in jobs}
+                    orig["jobs"] = {str(j.get("id")): j for j in jobs_now}
                 else:
-                    orig["jobs"] = jobs
+                    orig["jobs"] = jobs_now
                 payload = orig
         fd, tmp = tempfile.mkstemp(dir=cron_dir, prefix=".jobs_", suffix=".tmp")
         try:
