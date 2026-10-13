@@ -64,10 +64,6 @@ import base64, fcntl, json, os, stat, sys, glob, tempfile, time, subprocess
 # 是为了在本进程排队于 gateway 的 30s 临界区之后仍有机会拿到锁。
 LOCK_WAIT_SECONDS = 35.0
 
-# 通过 Hermes 自己的写路径改作业(via=hermes)时,单个 home 的子进程上界。
-# 要装下 import + 锁等待 + 一次原子写。
-HERMES_WRITE_TIMEOUT = 60
-
 mode, params = sys.argv[1], json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 
 # 全局等锁预算(秒,由本地侧传入 = SSH_TIMEOUT - margin)。所有 home 的锁等待
@@ -182,62 +178,92 @@ result = {"ok": True, "homes": [], "changed": [], "errors": [], "skipped": [],
 
 # 子进程:用 home 自带的 Hermes venv 走 update_job。与 gateway 同一条
 # 锁+reload+merge+normalize+原子写路径;存法以后改了也跟得上。
-# 输出一行 JSON:{ok, changed:[...]} 或 {ok:False, error}。stderr 留给异常。
+# 关键:gateway 的 _acquire_flock 超时返回 False 后会只拿进程内锁继续写
+# (为不冻 scheduler 的故意兜底,#60703)——对 gateway 合理,对我们就是
+# "锁被占还落盘"的洞。子进程把它 monkey-patch 成严格版:拿不到锁抛
+# RuntimeError(非 OSError,逃出 _jobs_lock 的 except,什么都不写)。
+# BUDGET 由父进程按剩余锁预算传入,子进程不会拖到本地 ssh 已超时之后才写。
 _HERMES_SET = r"""
-import json, sys
-home, ids, val, dry = sys.argv[1], json.loads(sys.argv[2]), \
-    json.loads(sys.argv[3]), sys.argv[4] == "1"
+import json, sys, os
+home, ids, val, budget = sys.argv[1], json.loads(sys.argv[2]), \
+    json.loads(sys.argv[3]), float(sys.argv[4])
 sys.path.insert(0, home + "/hermes-agent")
+os.environ["HERMES_HOME"] = home  # list_jobs 的 executions.db 按 home 定位,
+                                  # 不设会摸到 root 的库
+import cron.jobs as cj
 from cron.jobs import use_cron_store, list_jobs, update_job
+
+_orig_acquire = cj._acquire_flock
+def _strict_flock(fd, timeout):
+    # 等锁最多 budget 秒;拿不到就抛——绝不落到 gateway 的"无锁照写"兜底。
+    if _orig_acquire(fd, min(timeout, budget)) is not True:
+        raise RuntimeError("cron jobs lock busy (gateway 持锁或锁泄漏)")
+    return True
+cj._acquire_flock = _strict_flock
+
 out = {"ok": True, "changed": [], "skipped": [], "warnings": []}
 with use_cron_store(home):
-    if dry:
-        by_id = {str(j.get("id")): j for j in list_jobs()}
-        for jid in ids:
-            j = by_id.get(jid)
-            if j is None:
-                out["skipped"].append(jid)
-            else:
-                out["changed"].append({"id": jid, "name": j.get("name"),
-                                       "old": j.get("attach_to_session"),
-                                       "new": val})
-    else:
-        before = {str(j.get("id")): j.get("attach_to_session")
-                  for j in list_jobs()}
-        for jid in ids:
-            job = update_job(jid, {"attach_to_session": val})
-            if job is None:
-                out["skipped"].append(jid)
-                continue
-            out["changed"].append({"id": jid, "name": job.get("name"),
-                                   "old": before.get(jid),
-                                   "new": val})
+    before = {str(j.get("id")): j.get("attach_to_session")
+              for j in list_jobs()}
+    for jid in ids:
+        if before.get(jid) is val:
+            continue  # 已是目标值:不动,也不报 changed(update_job 总会写盘)
+        job = update_job(jid, {"attach_to_session": val})
+        if job is None:
+            out["skipped"].append(jid)
+            continue
+        out["changed"].append({"id": jid, "name": job.get("name"),
+                               "old": before.get(jid), "new": val})
 print("CA_JSON:" + json.dumps(out, ensure_ascii=False))
 """
 
 def hermes_python(home_dir):
-    """home 自带的 Hermes venv 解释器;没有就回 None(走 raw 路径)。"""
-    py = os.path.join(home_dir, "hermes-agent", "venv", "bin", "python")
-    return py if os.path.isfile(py) and os.access(py, os.X_OK) else None
+    """home 自带的 Hermes venv 解释器;profile home 用父 home 的 venv。
+    没有就回 None(走 raw 路径)。"""
+    for d in (home_dir, os.path.dirname(home_dir)):
+        py = os.path.join(d, "hermes-agent", "venv", "bin", "python")
+        if os.path.isfile(py) and os.access(py, os.X_OK):
+            return py
+    return None
 
-def set_via_hermes(label, home_dir, jf, ids, val, dry):
-    """用 home 自己的 Hermes 改 attach_to_session。返回 True 表示走了这条路
-    (结果已挂进 result);False/异常信息则回退到 raw 写路径。"""
+def set_via_hermes(label, home_dir, jf, ids, val):
+    """用 home 自己的 Hermes 改 attach_to_session。返回 True 走了这条路
+    (结果已挂进 result);False 回退到 raw 写。"""
     py = hermes_python(home_dir)
     if not py:
         return False
     if not ids:
-        return True  # 无可改,dry-run 也由 raw 路径出 pending
+        return True
     budget = lock_budget()
     if budget <= 0:
         result["errors"].append(
             "%s: lock fail 全局锁预算已耗尽,跳过(本地即将超时)" % label)
         return True
+    # 以 jobs.json 属主跑子进程:锁文件/output/executions.db 若在属主
+    # 是 gateway 用户时被我们创成 root:root,gateway 就拿不到跨进程锁了。
+    try:
+        st = os.stat(jf)
+        uid, gid = st.st_uid, st.st_gid
+    except OSError:
+        uid = gid = None
+    preexec = None
+    if uid is not None and os.geteuid() == 0 and uid != 0:
+        def _drop():
+            os.setgid(gid); os.setuid(uid)
+        preexec = _drop
+    env = dict(os.environ)
+    env["HERMES_HOME"] = home_dir
+    try:
+        import pwd
+        env["HOME"] = pwd.getpwuid(uid).pw_dir if uid is not None else home_dir
+    except Exception:
+        env["HOME"] = home_dir
     try:
         r = subprocess.run(
             [py, "-c", _HERMES_SET, home_dir, json.dumps(sorted(ids)),
-             json.dumps(val), "1" if dry else "0"],
-            capture_output=True, text=True, timeout=min(HERMES_WRITE_TIMEOUT, budget + 25))
+             json.dumps(val), repr(budget)],
+            capture_output=True, text=True, env=env, preexec_fn=preexec,
+            timeout=budget + 15)  # budget 等锁 + ~15s 启动/导入/写盘余量
     except subprocess.TimeoutExpired:
         result["errors"].append("%s: hermes update_job 超时" % label)
         return True
@@ -247,8 +273,15 @@ def set_via_hermes(label, home_dir, jf, ids, val, dry):
     line = next((l for l in r.stdout.splitlines() if l.startswith("CA_JSON:")), None)
     if r.returncode != 0 or not line:
         tail = (r.stderr or "").strip().splitlines()
-        result["errors"].append(
-            "%s: hermes update_job fail %s" % (label, tail[-1][:160] if tail else "no output"))
+        msg = tail[-1][:160] if tail else "no output"
+        # 老 Hermes 没有 use_cron_store/update_job → 回落到 raw 路径
+        # (但锁超时绝不能回落——那正是我们要防的"锁占还写")。
+        if "ImportError" in msg or "cannot import name" in msg or \
+           "ModuleNotFoundError" in msg:
+            result["warnings"].append(
+                "%s: hermes 版本过旧(%s),回落 raw 写" % (label, msg))
+            return False
+        result["errors"].append("%s: hermes update_job fail %s" % (label, msg))
         return True
     out = json.loads(line[len("CA_JSON:"):])
     for c in out.get("changed", []):
@@ -316,7 +349,7 @@ for label, jf, jobs, shape, hits in selected:
     # (否则每个 home 一次 import,太贵),由 raw 路径出 pending。
     if not params.get("dry_run"):
         ids = [str(j.get("id")) for j in hits]
-        if set_via_hermes(label, home_dir, jf, ids, params["value"], False):
+        if set_via_hermes(label, home_dir, jf, ids, params["value"]):
             continue
     lock_path = os.path.join(cron_dir, ".jobs.lock")
     try:

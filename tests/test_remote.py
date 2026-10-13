@@ -277,6 +277,31 @@ def test_raw_fallback_without_venv(home):
     assert read_jobs(jf)["jobs"][0]["attach_to_session"] is True
 
 
+@pytest.mark.skipif(not os.path.isfile(REAL_PY),
+                    reason="needs a real Hermes venv on this box")
+def test_via_hermes_refuses_when_lock_held(home):
+    """Regression for the step-0 hole: gateway's _acquire_flock returns False on
+    timeout and _jobs_lock proceeds with in-process locking only — so update_job
+    used to write while the lock was held. The strict patch must abort instead."""
+    src = os.path.join(home, "hermes-agent")
+    os.makedirs(src)
+    os.symlink(os.path.join(REAL_VENV, "venv"), src + "/venv")
+    for name in ("cron", "agent", "hermes_constants.py", "utils.py"):
+        os.symlink(os.path.join(REAL_VENV, name), src + "/" + name)
+    jf = home + "/cron/jobs.json"
+    write_jobs(jf, {"jobs": [{"id": "v2", "name": "held-lock",
+                              "schedule": {"kind": "every", "every_s": 60}}]})
+    lf = open(home + "/cron/.jobs.lock", "a+")
+    fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    try:
+        res = run("set", {**P, "budget_s": 3}, home)
+        assert res["errors"], res  # must report, not write through
+        assert read_jobs(jf)["jobs"][0].get("attach_to_session") is None
+    finally:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        lf.close()
+
+
 # ---------- list mode ----------
 
 def test_list_reports_jobs(home):
