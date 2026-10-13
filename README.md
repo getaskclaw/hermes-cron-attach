@@ -132,12 +132,21 @@ chmod +x cron_attach.py
 
 ## 安全要点
 
-- 远端拿 `<cron>/.jobs.lock` 的排他 flock 才读写,不会和 scheduler 的写交叉。
-- mkstemp + fsync + os.replace,中途崩溃留旧文件。
-- 只改 `attach_to_session`,其余字段与文件顶层键原样保留。
+- 远端拿 `<cron>/.jobs.lock` 的排他 flock 才读写,不会和 scheduler 的写交叉;`list` 只读不抢锁。
+- 写是 mkstemp + fsync + os.replace + 目录 fsync,中途崩溃留旧文件。
+- 写前先 `os.fchmod`+`os.fchown` 把原文件的 mode/owner 拷到临时文件——SSH 是 root 而 Hermes 跑在别人家目录下时,jobs.json 不会被改成 root 600 把 gateway 锁死。
+- `.jobs.lock` 不存在时按 cron 目录的属主创建,不抢成 root:root。
+- jobs.json 是符号链接时改写真实路径,不会把链接换成实体文件。
+- 只改 `attach_to_session`,其余字段与文件顶层键原样保留;jobs 原本是 dict 形态的按 id 键回写,schema 不变。
 - gateway 的 shrink-merge 只恢复缺失 id,同 id 字段以持锁方为准,改动不会被吃。
-- home 发现扫 `$HERMES_HOME`、SSH 用户 `~/.hermes`、`/root/.hermes`、`/home/*/.hermes` 及各自 `profiles/*`,按 realpath 去重——SSH 用户和 Hermes 用户经常不同。
-- 远端不落盘:payload 走 SSH stdin(`ssh host 'python3 -'`),除 jobs.json 编辑外不写目标文件系统。
+- `--profile` 精确匹配 profile 名,不会因子串误伤别的 profile 或同用户默认 home。
+- 跨文件歧义全局判:`--job` 在任一 home 合计命中 >1 个作业就整体拒绝,不是每个文件各放行一个。
+- 目标值已是现状就跳过写(`changed` 照列,文件不重写)。
+- home 发现扫 `$HERMES_HOME`、SSH 用户 `~/.hermes`、`/root/.hermes`、`/home/*/.hermes` 及各自 `profiles/*`,按 jobs.json 的 realpath 去重——SSH 用户和 Hermes 用户经常不同。
+- 远端除 `jobs.json`(必要时`.jobs.lock`、临时文件自清理)外不落盘:payload 走 SSH stdin(`ssh host 'python3 -'`)。
+- 远端任一 home 写失败只记进 `errors`,不影响其它 home;局部应用会如实报告。
+- `--host` 用 `StrictHostKeyChecking=accept-new`(TOFU);首次连接新节点仍有 MITM 窗口,敏感环境先手动 ssh 一次写进 known_hosts。
+- `command_argv` 跳链把参数拼进最后一项远端命令,对 `ssh` 可靠;换别的包装器(如 sudo 直接执行)需确认它会把尾部参数透传给 `python3 -`。
 
 ## 名册格式(可选,仅 --node 用)
 
@@ -149,13 +158,13 @@ chmod +x cron_attach.py
 }}
 ```
 
-`command_argv` 是跳链逃生口:最后一项是远端命令,工具往它后面追加 mode + base64 参数。
+`command_argv` 是跳链逃生口:最后一项是远端命令,工具往它后面追加 mode + base64 参数。这要求最后一项本身是个「接受尾部参数并透传给 python3 -」的命令——对 `ssh` 成立(ssh 会把多余参数拼进远端命令行),对直接的 `sudo`/`rsh` 包装器要先验证。
 
 ## 不做什么
 
 - 不发消息,投递仍是 gateway 的事。
 - 不做会话 seeding——续聊是 gateway 侧状态,本工具不复刻。
-- 不在远端安装任何东西。
+- 不在远端安装任何东西;除 `jobs.json` 写入外,只在 cron 目录留 `.jobs.lock`(必要的锁文件)和自清理的临时文件。
 
 ## 出处
 

@@ -63,17 +63,25 @@ Optional; only needed for `--node`. A JSON object with a `nodes` map:
 
 ## How it stays safe
 
-- **Same lock as the gateway.** Remote payload opens `<cron dir>/.jobs.lock` and `flock(LOCK_EX)` before reading. The gateway's own read-modify-write sections use the identical lock, so this can't interleave with a scheduler save.
-- **Atomic write.** Serialize to a `mkstemp` file in the cron dir, `fsync`, `os.replace` onto `jobs.json`. A crash mid-write leaves the old file.
-- **One field only.** Everything else in the job record (schedule, deliver, monitor state, next_run_at, …) is preserved verbatim. Top-level keys of the file (`updated_at`, etc.) are kept too.
+- **Same lock as the gateway.** `set` opens `<cron dir>/.jobs.lock` and `flock(LOCK_EX)` before writing; `list` reads lock-free. The gateway's own read-modify-write sections use the identical lock, so this can't interleave with a scheduler save.
+- **Atomic write.** Serialize to a `mkstemp` file in the cron dir, `fsync`, `os.replace` onto `jobs.json`, then `fsync` the directory. A crash mid-write leaves the old file.
+- **Ownership and mode preserved.** Before replacing, the temp file is `fchmod`/`fchown`ed to the original's mode and uid/gid — SSHing in as root against a Hermes home under another user can't leave `jobs.json` root-owned 600 and lock the gateway out. `.jobs.lock` is created with the cron dir's owner, never root:root inside a user dir.
+- **Symlinks handled.** If `jobs.json` is a symlink the write targets its realpath — the link is never replaced by a regular file.
+- **One field only.** Everything else in the job record (schedule, deliver, monitor state, next_run_at, …) is preserved verbatim; a `jobs` map that was a dict is written back keyed by id — schema unchanged.
 - **The gateway's shrink-merge can't eat it.** That merge only resurrects job ids *absent* from a save payload; a same-id job's field is decided by whoever holds the lock — which is this tool during its write.
-- **Home discovery** scans `$HERMES_HOME`, the SSH user's `~/.hermes`, `/root/.hermes`, every `/home/*/.hermes`, and all their `profiles/*`, deduped by realpath — because the SSH user and the Hermes user are often different (e.g. root in, Hermes under `/home/deploy`).
+- **Exact profile match.** `--profile` compares the profile segment exactly — `--profile prod` can't hit `prod2`, and a name that happens to match a *username* can't pull in every `home:USER` default home.
+- **Global ambiguity check.** A `--job` substring matching jobs across any number of homes refuses as a whole (not one-per-file); `--force-multi` overrides.
+- **No-op safe.** Jobs already at the target value are listed in `changed` but don't trigger a rewrite.
+- **Home discovery** scans `$HERMES_HOME`, the SSH user's `~/.hermes`, `/root/.hermes`, every `/home/*/.hermes`, and all their `profiles/*`, deduped by jobs.json realpath — because the SSH user and the Hermes user are often different (e.g. root in, Hermes under `/home/deploy`).
+- **Per-home failure isolation.** A write failure in one home lands in `errors` and the rest still apply — partially-applied results are reported, not swallowed by a bare traceback.
+- **TOFU caveat.** `--host` uses `StrictHostKeyChecking=accept-new`: MITM on *first* connect to a new node is unmitigated; ssh manually once first in sensitive environments.
+- **`command_argv` caveat.** Jump-chain args are appended to the remote command's last element — works for `ssh`; other wrappers (e.g. a bare `sudo` exec) must pass trailing args through to `python3 -`.
 
 ## What it does NOT do
 
 - **No message sending.** Delivery stays with the Hermes gateway. This is a flag toggler, not a reporter.
 - **No session seeding.** The continuable-thread magic (replies routing to an agent with context) is gateway state. Turning the flag on makes Hermes do it; this tool doesn't reimplement it.
-- **No remote installs.** The payload streams over SSH stdin (`ssh host 'python3 -'`), nothing is written to the target filesystem except the jobs.json edit.
+- **No remote installs.** The payload streams over SSH stdin (`ssh host 'python3 -'`); besides the `jobs.json` write it only leaves `.jobs.lock` (the lock it shares with the gateway) and self-cleaning temp files.
 
 ## License
 

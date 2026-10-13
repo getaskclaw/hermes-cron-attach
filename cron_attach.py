@@ -52,7 +52,7 @@ SSH_TIMEOUT = 30
 # 通过 argv: python3 - <mode> <params_b64>
 # (params 走 base64:command_argv 路径上命令要穿过两层 shell 引号,裸 JSON 会被剥引号)
 REMOTE = r'''
-import base64, fcntl, json, os, sys, glob, tempfile
+import base64, fcntl, json, os, stat, sys, glob, tempfile
 
 mode, params = sys.argv[1], json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 
@@ -64,7 +64,12 @@ def homes():
     if env_home:
         cands.append(("env", env_home))
     ssh_home = os.path.expanduser("~/.hermes")
-    cands.append(("home:" + (os.environ.get("USER") or "?"), ssh_home))
+    try:
+        import pwd
+        user_name = pwd.getpwuid(os.stat(os.path.dirname(ssh_home) or "/").st_uid).pw_name
+    except Exception:
+        user_name = os.environ.get("USER") or os.environ.get("LOGNAME") or "?"
+    cands.append(("home:" + user_name, ssh_home))
     for base in ("/root/.hermes",):
         cands.append(("home:root", base))
     for p in sorted(glob.glob("/home/*/.hermes")):
@@ -90,83 +95,157 @@ def load(jf):
     with open(jf, encoding="utf-8-sig") as f:
         data = json.load(f)
     if isinstance(data, dict):
-        return data.get("jobs") or [], "dict"
+        j = data.get("jobs")
+        if isinstance(j, list):
+            return j, "dict"
+        if isinstance(j, dict):
+            return list(j.values()), "dict"
+        return [], "dict"
     return (data if isinstance(data, list) else []), "list"
 
 def match(job, pats):
     jid = str(job.get("id") or "")
     name = str(job.get("name") or "")
-    return any(p == jid or p.lower() in name.lower() for p in pats)
+    return any(p and (p == jid or p.lower() in name.lower()) for p in pats)
 
-result = {"ok": True, "homes": [], "changed": [], "errors": [], "skipped": []}
+def profile_matches(label, prof):
+    """label 形如 home:USER 或 home:USER|profile:NAME;精确匹配 profile 名。
+    给了 --profile 就只中 profile 段,不匹 home 部分(避免 'ubuntu' 匹配所有 home:ubuntu*).
+    """
+    if "|profile:" not in label:
+        return False
+    return label.rsplit("|profile:", 1)[1] == prof
+
+def preserve(src_path, tmp_fd):
+    """把 src 的 mode/owner 拷到 tmp fd 上。owner 拷贝失败在非 root 下正常,
+    mode 拷贝是底线。返回告警串列表。"""
+    warns = []
+    try:
+        st = os.stat(src_path)
+    except OSError as e:
+        return ["stat %s fail %s" % (src_path, e)]
+    try:
+        os.fchmod(tmp_fd, stat.S_IMODE(st.st_mode))
+    except OSError as e:
+        warns.append("chmod fail %s" % e)
+    try:
+        os.fchown(tmp_fd, st.st_uid, st.st_gid)
+    except (OSError, AttributeError) as e:
+        warns.append("chown fail %s(非属主时正常)" % e)
+    return warns
+
+result = {"ok": True, "homes": [], "changed": [], "errors": [], "skipped": [],
+          "warnings": []}
+
+# 第一遍:收集所有匹配,先判全局歧义,再动手写。
+selected = []  # [(label, jf, jobs, shape, hits)]
 for label, jf in homes():
-    if params.get("profile") and \
-       params["profile"] not in label and \
-       "profile:" + str(params["profile"]) not in label:
+    if params.get("profile") and not profile_matches(label, str(params["profile"])):
         continue
+    try:
+        jobs, shape = load(jf)
+    except Exception as e:
+        result["errors"].append("%s: load fail %s" % (label, e))
+        continue
+    if mode == "list":
+        result["homes"].append({"home": label, "jobs_file": jf, "jobs": [
+            {"id": j.get("id"), "name": j.get("name"),
+             "attach": j.get("attach_to_session"),
+             "deliver": j.get("deliver"), "no_agent": j.get("no_agent"),
+             "enabled": j.get("enabled", True),
+             "next_run_at": j.get("next_run_at")}
+            for j in jobs if isinstance(j, dict)]})
+        continue
+    pats = params.get("patterns") or []
+    hits = [j for j in jobs if isinstance(j, dict)
+            and (params.get("all_jobs") or match(j, pats))]
+    if hits:
+        selected.append((label, jf, jobs, shape, hits))
+    else:
+        result["skipped"].append("%s: 无匹配作业" % label)
+
+if mode == "set" and not params.get("all_jobs") and not params.get("force_multi"):
+    total = sum(len(h) for _, _, _, _, h in selected)
+    if total > 1:
+        detail = ", ".join("%s:%s" % (lb, ",".join(str(j.get("id")) for j in h))
+                           for lb, _, _, _, h in selected)
+        result["errors"].append(
+            "跨 %d 个文件共匹配 %d 个作业,拒绝执行: %s" % (len(selected), total, detail))
+        print(json.dumps(result, ensure_ascii=False)); sys.exit(0)
+
+# 第二遍:对 selected 里的每个 home 上锁改写。
+for label, jf, jobs, shape, hits in selected:
     cron_dir = os.path.dirname(jf)
+    real_jf = os.path.realpath(jf)
+    if real_jf != jf:
+        result["warnings"].append("%s: jobs.json 是符号链接,写真实路径 %s" % (label, real_jf))
+        jf = real_jf
+        cron_dir = os.path.dirname(jf)
     lock_path = os.path.join(cron_dir, ".jobs.lock")
     try:
+        # 目录属主优先:别让锁文件被建成 root:root 而 gateway 开不了
+        try:
+            dir_st = os.stat(cron_dir)
+            if not os.path.exists(lock_path):
+                fd0 = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+                try:
+                    os.fchown(fd0, dir_st.st_uid, dir_st.st_gid)
+                except (OSError, AttributeError):
+                    pass
+                os.close(fd0)
+        except OSError:
+            pass
         lf = open(lock_path, "a+")
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
     except OSError as e:
         result["errors"].append("%s: lock fail %s" % (label, e))
         continue
     try:
-        jobs, shape = load(jf)
+        target = params["value"]
+        to_write = False
+        for j in hits:
+            old = j.get("attach_to_session")
+            result["changed"].append({"home": label, "id": j.get("id"),
+                                      "name": j.get("name"),
+                                      "old": old, "new": target})
+            if not params.get("dry_run"):
+                if old is not target:
+                    j["attach_to_session"] = target
+                    to_write = True
+        if params.get("dry_run") or not to_write:
+            continue  # finally 仍解锁
+        payload = jobs if shape == "list" else None
+        if shape == "dict":
+            with open(jf, encoding="utf-8-sig") as f:
+                orig = json.load(f)
+            if isinstance(orig, dict):
+                if isinstance(orig.get("jobs"), dict):
+                    # jobs 原本是 dict:按 id 键回写,保持 schema 不变
+                    orig["jobs"] = {str(j.get("id")): j for j in jobs}
+                else:
+                    orig["jobs"] = jobs
+                payload = orig
+        fd, tmp = tempfile.mkstemp(dir=cron_dir, prefix=".jobs_", suffix=".tmp")
+        try:
+            for w in preserve(jf, fd):
+                result["warnings"].append("%s: %s" % (label, w))
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+                f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, jf)
+            try:
+                dfd = os.open(cron_dir, os.O_DIRECTORY | os.O_RDONLY)
+                os.fsync(dfd); os.close(dfd)
+            except OSError:
+                pass
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception as e:
-        fcntl.flock(lf.fileno(), fcntl.LOCK_UN); lf.close()
-        result["errors"].append("%s: load fail %s" % (label, e))
-        continue
-
-    try:
-        if mode == "list":
-            result["homes"].append({"home": label, "jobs_file": jf, "jobs": [
-                {"id": j.get("id"), "name": j.get("name"),
-                 "attach": j.get("attach_to_session"),
-                 "deliver": j.get("deliver"), "no_agent": j.get("no_agent"),
-                 "enabled": j.get("enabled"),
-                 "next_run_at": j.get("next_run_at")}
-                for j in jobs if isinstance(j, dict)]})
-        else:  # set
-            target = params["value"]
-            pats = params.get("patterns") or []
-            hits = [j for j in jobs if isinstance(j, dict)
-                    and (params.get("all_jobs") or match(j, pats))]
-            if not hits:
-                result["skipped"].append("%s: 无匹配作业" % label)
-            elif len(hits) > 1 and not params.get("all_jobs") and not params.get("force_multi"):
-                result["errors"].append("%s: 匹配到 %d 个作业,拒绝执行: %s" % (
-                    label, len(hits), ", ".join(str(j.get("id")) for j in hits)))
-            else:
-                for j in hits:
-                    old = j.get("attach_to_session")
-                    result["changed"].append({"home": label, "id": j.get("id"),
-                                              "name": j.get("name"),
-                                              "old": old, "new": target})
-                    if not params.get("dry_run"):
-                        j["attach_to_session"] = target
-                if not params.get("dry_run"):
-                    payload = {"jobs": jobs} if shape == "dict" else jobs
-                    if shape == "dict":
-                        # 保留原文件顶层其它键
-                        with open(jf, encoding="utf-8-sig") as f:
-                            orig = json.load(f)
-                        if isinstance(orig, dict):
-                            orig["jobs"] = jobs
-                            payload = orig
-                    fd, tmp = tempfile.mkstemp(dir=cron_dir, prefix=".jobs_", suffix=".tmp")
-                    try:
-                        with os.fdopen(fd, "w", encoding="utf-8") as f:
-                            json.dump(payload, f, indent=2, ensure_ascii=False)
-                            f.flush(); os.fsync(f.fileno())
-                        os.replace(tmp, jf)
-                    except BaseException:
-                        try:
-                            os.unlink(tmp)
-                        except OSError:
-                            pass
-                        raise
+        result["errors"].append("%s: write fail %s" % (label, e))
     finally:
         try:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN); lf.close()
@@ -182,7 +261,11 @@ def load_nodes(path=None):
     if not path or not os.path.isfile(path):
         return {}
     with open(path, encoding="utf-8") as f:
-        return json.load(f)["nodes"]
+        data = json.load(f)
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    if not isinstance(nodes, dict):
+        raise SystemExit("名册格式错误:%s 缺 'nodes' 键" % path)
+    return nodes
 
 
 def node_from_host(args):
@@ -226,19 +309,21 @@ def run_remote(node, mode, params):
     pb64 = base64.b64encode(json.dumps(params, ensure_ascii=False).encode()).decode()
     argv = ssh_argv(node, [mode, pb64])
     try:
-        done = subprocess.run(argv, input=REMOTE, capture_output=True, text=True,
-                              timeout=SSH_TIMEOUT)
+        done = subprocess.run(argv, input=REMOTE.encode("utf-8"),
+                              capture_output=True, timeout=SSH_TIMEOUT)
+        out = done.stdout.decode("utf-8", errors="replace")
+        err = done.stderr.decode("utf-8", errors="replace")
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "ssh 超时 %ds" % SSH_TIMEOUT}
     except Exception as exc:
         return {"ok": False, "error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
     if done.returncode != 0:
-        err = (done.stderr or "").strip().splitlines()
-        return {"ok": False, "error": "exit=%s %s" % (done.returncode, err[-1][:160] if err else "")}
+        lines = err.strip().splitlines()
+        return {"ok": False, "error": "exit=%s %s" % (done.returncode, lines[-1][:160] if lines else "")}
     try:
-        return json.loads(done.stdout)
+        return json.loads(out)
     except Exception as exc:
-        return {"ok": False, "error": "输出不是 JSON: %s %s" % (exc, (done.stdout or "")[:120])}
+        return {"ok": False, "error": "输出不是 JSON: %s %s" % (exc, out[:120])}
 
 
 def fmt_attach(v):
@@ -249,7 +334,7 @@ def cmd_list(args):
     nodes = {} if args.host else load_nodes(args.nodes)
     if args.host:
         nodes[args.host] = node_from_host(args)
-    names = list(nodes) if (args.node or []) == ["all"] or args.host else args.node
+    names = list(nodes) if (args.node and "all" in args.node) or args.host else args.node
     rc = 0
     for name in names:
         node = nodes.get(name)
@@ -282,6 +367,8 @@ def cmd_set(args):
             print("✗ %s: 不在名册" % args.node); return 1
     if not args.all_jobs and not args.job:
         print("✗ set 需要 --job PATTERN 或 --all-jobs"); return 2
+    if args.job and not all(args.job):
+        print("✗ --job 不能是空串(会匹配所有作业;要全开用 --all-jobs)"); return 2
     params = {"value": args.on, "patterns": args.job or [],
               "all_jobs": args.all_jobs, "force_multi": args.force_multi,
               "dry_run": args.dry_run, "profile": args.profile}
@@ -295,6 +382,8 @@ def cmd_set(args):
             fmt_attach(c["new"]), (c["name"] or "")[:40]))
     for e in res.get("skipped") or []:
         print("  · %s" % e)
+    for e in res.get("warnings") or []:
+        print("  ⚠ %s" % e)
     for e in res.get("errors") or []:
         print("⚠ %s" % e)
     if not res["changed"] and not res.get("errors"):
