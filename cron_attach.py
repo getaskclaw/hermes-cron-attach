@@ -46,7 +46,8 @@ import time
 
 NODES_PATH = os.environ.get("FLEET_NODES", "")
 
-SSH_TIMEOUT = 30
+# 整个 ssh 调用的上界,含远端所有 home 的排队等锁时间;家多的节点可调大。
+SSH_TIMEOUT = int(os.environ.get("CRON_ATTACH_SSH_TIMEOUT", "90"))
 
 # ---- 远端载荷:枚举 home → 列作业 或 在锁内改 attach_to_session ----
 # 通过 argv: python3 - <mode> <params_b64>
@@ -222,16 +223,18 @@ for label, jf, jobs, shape, hits in selected:
                 result["skipped"].append("%s: 匹配作业已不存在" % label)
                 continue
         to_write = False
+        pending = []
         for j in hits_now:
             old = j.get("attach_to_session")
-            result["changed"].append({"home": label, "id": j.get("id"),
-                                      "name": j.get("name"),
-                                      "old": old, "new": target})
+            pending.append({"home": label, "id": j.get("id"),
+                            "name": j.get("name"),
+                            "old": old, "new": target})
             if not params.get("dry_run"):
                 if old is not target:
                     j["attach_to_session"] = target
                     to_write = True
         if params.get("dry_run") or not to_write:
+            result["changed"].extend(pending)  # dry-run:报告计划改动;no-op:照列
             continue  # finally 仍解锁
         payload = jobs_now if shape == "list" else None
         if shape == "dict":
@@ -257,6 +260,7 @@ for label, jf, jobs, shape, hits in selected:
                 os.fsync(dfd); os.close(dfd)
             except OSError:
                 pass
+            result["changed"].extend(pending)  # 写成功才算 changed
         except BaseException:
             try:
                 os.unlink(tmp)
