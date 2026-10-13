@@ -6,6 +6,8 @@ Toggle `attach_to_session` on Hermes Agent cron jobs — locally or across a fle
 
 When `attach_to_session` is on, a cron job's report is delivered into a **fresh, continuable Telegram thread** (a DM forum topic) instead of a one-shot broadcast message. Replies in that thread reach the agent with the job's context. This tool just flips the flag; delivery and threading are the Hermes gateway's job.
 
+Note: Telegram threads need the bot's Threaded Mode enabled (BotFather → Bot Settings → Threads Settings). Without it the flag still works, reports just fall back to the plain DM.
+
 ## Why
 
 `hermes cron edit` has no `--attach` flag. The only way to change `attach_to_session` on an existing job is editing `cron/jobs.json` — which the live gateway owns. This tool does that edit **safely**: it takes the same `<cron>/.jobs.lock` flock the gateway and CLI use, changes only that one field, and writes back via `mkstemp` + `os.replace` (atomic).

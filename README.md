@@ -7,6 +7,8 @@
 
 开着 = 作业报告落到 Telegram 独立可续聊的线程(新会话);关掉 = 一次性广播。本工具只负责改开关,投递和线程由 Hermes gateway 完成。
 
+注:Telegram 线程要 bot 开 Threaded Mode(BotFather → Bot Settings → Threads Settings)。没开也能用,报告退回普通私聊,只是不在新会话里。
+
 ## 为什么需要它
 
 `hermes cron edit` 没有 `--attach` 旗标,改 `cron/jobs.json` 是唯一路径,而这个文件归活着的 gateway 管。本工具在远端 `<cron>/.jobs.lock` 上 flock(和 gateway 同一把跨进程锁)后读写,用 `mkstemp`+`os.replace` 原子替换,只动 `attach_to_session` 一个字段。
