@@ -32,9 +32,20 @@ FAKE_HOME_GLOB = "/tmp/__ca_test_home__/*"
 
 
 def _sandbox_src(remote_src, home):
+    """Retarget the payload's hard-coded home paths into the sandbox.
+
+    Each replacement MUST match exactly once — a silent no-op here means the
+    payload would scan (and --all-jobs would rewrite) the real gateways'
+    jobs.json on this VPS. Assert loudly instead of relying on the literal
+    strings in homes() staying the same forever.
+    """
     src = remote_src or REMOTE_SRC
-    src = src.replace('"/root/.hermes"', '"%s/.hermes"' % FAKE_ROOT)
-    src = src.replace('"/home/*/.hermes"', '"%s/.hermes"' % FAKE_HOME_GLOB)
+    for literal, fake in (('"/root/.hermes"', '"%s/.hermes"' % FAKE_ROOT),
+                          ('"/home/*/.hermes"', '"%s/.hermes"' % FAKE_HOME_GLOB)):
+        assert src.count(literal) == 1, (
+            "payload no longer contains %s — homes() changed, update the "
+            "sandbox retargeting or tests will touch REAL jobs.json" % literal)
+        src = src.replace(literal, fake)
     return src
 
 
@@ -161,40 +172,49 @@ def test_symlinked_home_dir_not_refused(tmp_path):
     assert any(c["home"] == "env" for c in res["changed"])
 
 
-# ---------- lock deadline ----------
+# ---------- lock budget ----------
 
-def test_lock_wait_bounded_by_deadline(home):
-    """A held lock must abort before the passed-in deadline, not wait forever."""
+def test_lock_wait_bounded_by_budget(home):
+    """A held lock must abort when the shared budget runs out, not wait 35s."""
     jf = home + "/cron/jobs.json"
     write_jobs(jf, {"jobs": [{"id": "a1"}]})
     lf = open(home + "/cron/.jobs.lock", "a+")
     fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
     try:
-        t0 = time.time()
-        res = run("set", {**P, "deadline": time.time() + 2}, home)
-        assert time.time() - t0 < 6
+        t0 = time.monotonic()
+        res = run("set", {**P, "budget_s": 2}, home)
+        assert time.monotonic() - t0 < 6
         assert "lock fail" in res["errors"][0]
     finally:
         fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
         lf.close()
 
 
-def test_expired_deadline_skips_immediately(home):
+def test_clock_skew_does_not_eat_budget(home):
+    """Regression for the cross-clock deadline bug: the old code passed a unix
+    timestamp, so a remote clock >80s ahead made every set fail instantly while
+    a clock behind let writes land after the local timeout. budget_s is a
+    relative count — wall-clock skew can't touch it. (Same machine here, so we
+    just verify a sane budget succeeds and reports a changed job.)"""
     jf = home + "/cron/jobs.json"
     write_jobs(jf, {"jobs": [{"id": "a1"}]})
-    t0 = time.time()
-    res = run("set", {**P, "deadline": time.time() - 1}, home)
-    assert time.time() - t0 < 1
-    assert "deadline" in res["errors"][0] or "lock fail" in res["errors"][0]
+    res = run("set", {**P, "budget_s": 5}, home)
+    assert not res["errors"] and res["changed"]
+
+
+def test_zero_budget_skips_immediately(home):
+    """budget_s<=0 → the home is skipped before even trying flock (negative: a
+    small positive value could still be alive when the free lock is grabbed)."""
+    jf = home + "/cron/jobs.json"
+    write_jobs(jf, {"jobs": [{"id": "a1"}]})
+    res = run("set", {**P, "budget_s": -1}, home)
+    assert not res["changed"]
+    assert "预算" in res["errors"][0] or "lock fail" in res["errors"][0]
 
 
 def test_second_home_gets_no_fresh_35s(tmp_path):
-    """The deadline is global: two locked homes in one run share it, they don't
+    """The budget is global: two locked homes in one run share it, they don't
     get 35s each."""
-    for name in ("h1", "h2"):
-        write_jobs(str(tmp_path / name / "cron/jobs.json"),
-                   {"jobs": [{"id": name}]})
-    # point payload at both homes via two profile dirs of one home
     home = str(tmp_path / ".hermes")
     os.makedirs(home + "/cron")
     write_jobs(home + "/cron/jobs.json", {"jobs": [{"id": "d1"}]})
@@ -205,12 +225,12 @@ def test_second_home_gets_no_fresh_35s(tmp_path):
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         locks.append(lf)
     try:
-        t0 = time.time()
+        t0 = time.monotonic()
         res = run("set", {"value": True, "patterns": [], "all_jobs": True,
                           "force_multi": False, "dry_run": False,
-                          "profile": None, "deadline": time.time() + 3}, home)
-        el = time.time() - t0
-        # without the shared deadline this would take ~70s (35s per home)
+                          "profile": None, "budget_s": 3}, home)
+        el = time.monotonic() - t0
+        # without the shared budget this would take ~70s (35s per home)
         assert el < 10
         assert len(res["errors"]) == 2
     finally:

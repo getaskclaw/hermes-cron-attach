@@ -50,6 +50,9 @@ NODES_PATH = os.environ.get("FLEET_NODES", "")
 
 # 整个 ssh 调用的上界,含远端所有 home 的排队等锁时间;家多的节点可调大。
 SSH_TIMEOUT = int(os.environ.get("CRON_ATTACH_SSH_TIMEOUT", "90"))
+# 远端等锁预算 = SSH_TIMEOUT - margin。margin 要盖住 ssh 建连(ConnectTimeout=8,
+# 可能还有 ProxyJump 第二跳)、stdin 写 payload、远端解释器启动和 stdout 回程。
+SSH_MARGIN = 25.0
 
 # ---- 远端载荷:枚举 home → 列作业 或 在锁内改 attach_to_session ----
 # 通过 argv: python3 - <mode> <params_b64>
@@ -63,14 +66,16 @@ LOCK_WAIT_SECONDS = 35.0
 
 mode, params = sys.argv[1], json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 
-# 全局截止时间(unix ts,由本地侧传入 = SSH_TIMEOUT - margin)。所有 home 的
-# 锁等待共用这一个 deadline,否则 N 个 home 各等 35s,总和可以越过本地
-# SSH_TIMEOUT——远端在用户已看到超时后仍然落盘。
-DEADLINE = float(params.get("deadline") or (time.time() + LOCK_WAIT_SECONDS))
+# 全局等锁预算(秒,由本地侧传入 = SSH_TIMEOUT - margin)。所有 home 的锁等待
+# 共用这一份预算:否则 N 个 home 各等 35s,总和可以越过本地 SSH_TIMEOUT——远端
+# 在用户已看到超时后仍然落盘。预算用 time.monotonic() 自减,是相对量:本机与
+# 远端时钟有多少漂移都不影响,不会出现远端时钟快导致"deadline 已过"误报。
+_budget_end = time.monotonic() + float(
+    params.get("budget_s") or LOCK_WAIT_SECONDS)
 
 def lock_budget():
     """本次等锁还剩多少秒。<=0 即不该再等。"""
-    return min(LOCK_WAIT_SECONDS, max(0.0, DEADLINE - time.time()))
+    return min(LOCK_WAIT_SECONDS, max(0.0, _budget_end - time.monotonic()))
 
 def homes():
     # 覆盖三种常见布局: $HERMES_HOME、SSH 用户的 ~/.hermes、以及 root 登录时
@@ -240,7 +245,7 @@ for label, jf, jobs, shape, hits in selected:
         # SSH_TIMEOUT 约束,不会拖到本地超时之后才写。
         budget = lock_budget()
         if budget <= 0:
-            raise TimeoutError("全局 deadline 已过,跳过(本地即将超时)")
+            raise TimeoutError("全局锁预算已耗尽,跳过(本地即将超时)")
         deadline = time.monotonic() + budget
         while True:
             try:
@@ -389,12 +394,19 @@ def ssh_argv(node, remote_args):
 
 
 def run_remote(node, mode, params):
-    # 远端等锁的全局 deadline = SSH_TIMEOUT - margin。margin 给本地 subprocess
-    # 调用本身(ssh 建连、stdin 写 payload、stdout 回程)留量:远端在本地 kill
-    # 之前就停下,不会出现"用户看到超时、改动却晚到"。list 模式不持锁,不用给。
+    # 远端等锁预算(秒)= SSH_TIMEOUT - margin。传相对秒数而不是本地 unix 时间戳:
+    # 两端时钟漂移与预算无关(远端 monotonic 自减),远端时钟快不会误报、慢不会
+    # 透支。margin 盖 ssh 建连/ProxyJump/写 payload/回程;预算耗尽时远端在本地
+    # kill 前停手,不会出现"用户看到超时、改动却晚到"。list 模式不持锁,不用给。
     if mode == "set":
+        budget = SSH_TIMEOUT - SSH_MARGIN
+        if budget < 5.0:
+            return {"ok": False, "error":
+                    "CRON_ATTACH_SSH_TIMEOUT=%ds 太小:set 需要 ≥%ds 才装得下 "
+                    "%.0fs 连接/传输开销 + ≥5s 等锁预算"
+                    % (SSH_TIMEOUT, int(SSH_MARGIN) + 5, SSH_MARGIN)}
         params = dict(params)
-        params["deadline"] = time.time() + max(5.0, SSH_TIMEOUT - 10.0)
+        params["budget_s"] = budget
     pb64 = base64.b64encode(json.dumps(params, ensure_ascii=False).encode()).decode()
     argv = ssh_argv(node, [mode, pb64])
     try:
