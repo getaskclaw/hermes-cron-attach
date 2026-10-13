@@ -58,11 +58,15 @@ SSH_MARGIN = 25.0
 # 通过 argv: python3 - <mode> <params_b64>
 # (params 走 base64:command_argv 路径上命令要穿过两层 shell 引号,裸 JSON 会被剥引号)
 REMOTE = r'''
-import base64, fcntl, json, os, stat, sys, glob, tempfile, time
+import base64, fcntl, json, os, stat, sys, glob, tempfile, time, subprocess
 
 # 拿锁上界(秒)。Hermes 自身是 30s(cron/jobs.py::_JOBS_LOCK_TIMEOUT_SECONDS),多等 5s
 # 是为了在本进程排队于 gateway 的 30s 临界区之后仍有机会拿到锁。
 LOCK_WAIT_SECONDS = 35.0
+
+# 通过 Hermes 自己的写路径改作业(via=hermes)时,单个 home 的子进程上界。
+# 要装下 import + 锁等待 + 一次原子写。
+HERMES_WRITE_TIMEOUT = 60
 
 mode, params = sys.argv[1], json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 
@@ -70,8 +74,10 @@ mode, params = sys.argv[1], json.loads(base64.b64decode(sys.argv[2]).decode("utf
 # 共用这一份预算:否则 N 个 home 各等 35s,总和可以越过本地 SSH_TIMEOUT——远端
 # 在用户已看到超时后仍然落盘。预算用 time.monotonic() 自减,是相对量:本机与
 # 远端时钟有多少漂移都不影响,不会出现远端时钟快导致"deadline 已过"误报。
-_budget_end = time.monotonic() + float(
-    params.get("budget_s") or LOCK_WAIT_SECONDS)
+# budget_s 是显式值:0 就是"别等锁",不能用 or 兜底成 35s。
+_budget_s = params.get("budget_s")
+_budget_end = time.monotonic() + (float(_budget_s) if _budget_s is not None
+                                  else LOCK_WAIT_SECONDS)
 
 def lock_budget():
     """本次等锁还剩多少秒。<=0 即不该再等。"""
@@ -174,6 +180,85 @@ def preserve(src_path, tmp_fd):
 result = {"ok": True, "homes": [], "changed": [], "errors": [], "skipped": [],
           "warnings": []}
 
+# 子进程:用 home 自带的 Hermes venv 走 update_job。与 gateway 同一条
+# 锁+reload+merge+normalize+原子写路径;存法以后改了也跟得上。
+# 输出一行 JSON:{ok, changed:[...]} 或 {ok:False, error}。stderr 留给异常。
+_HERMES_SET = r"""
+import json, sys
+home, ids, val, dry = sys.argv[1], json.loads(sys.argv[2]), \
+    json.loads(sys.argv[3]), sys.argv[4] == "1"
+sys.path.insert(0, home + "/hermes-agent")
+from cron.jobs import use_cron_store, list_jobs, update_job
+out = {"ok": True, "changed": [], "skipped": [], "warnings": []}
+with use_cron_store(home):
+    if dry:
+        by_id = {str(j.get("id")): j for j in list_jobs()}
+        for jid in ids:
+            j = by_id.get(jid)
+            if j is None:
+                out["skipped"].append(jid)
+            else:
+                out["changed"].append({"id": jid, "name": j.get("name"),
+                                       "old": j.get("attach_to_session"),
+                                       "new": val})
+    else:
+        before = {str(j.get("id")): j.get("attach_to_session")
+                  for j in list_jobs()}
+        for jid in ids:
+            job = update_job(jid, {"attach_to_session": val})
+            if job is None:
+                out["skipped"].append(jid)
+                continue
+            out["changed"].append({"id": jid, "name": job.get("name"),
+                                   "old": before.get(jid),
+                                   "new": val})
+print("CA_JSON:" + json.dumps(out, ensure_ascii=False))
+"""
+
+def hermes_python(home_dir):
+    """home 自带的 Hermes venv 解释器;没有就回 None(走 raw 路径)。"""
+    py = os.path.join(home_dir, "hermes-agent", "venv", "bin", "python")
+    return py if os.path.isfile(py) and os.access(py, os.X_OK) else None
+
+def set_via_hermes(label, home_dir, jf, ids, val, dry):
+    """用 home 自己的 Hermes 改 attach_to_session。返回 True 表示走了这条路
+    (结果已挂进 result);False/异常信息则回退到 raw 写路径。"""
+    py = hermes_python(home_dir)
+    if not py:
+        return False
+    if not ids:
+        return True  # 无可改,dry-run 也由 raw 路径出 pending
+    budget = lock_budget()
+    if budget <= 0:
+        result["errors"].append(
+            "%s: lock fail 全局锁预算已耗尽,跳过(本地即将超时)" % label)
+        return True
+    try:
+        r = subprocess.run(
+            [py, "-c", _HERMES_SET, home_dir, json.dumps(sorted(ids)),
+             json.dumps(val), "1" if dry else "0"],
+            capture_output=True, text=True, timeout=min(HERMES_WRITE_TIMEOUT, budget + 25))
+    except subprocess.TimeoutExpired:
+        result["errors"].append("%s: hermes update_job 超时" % label)
+        return True
+    except Exception as e:
+        result["errors"].append("%s: hermes venv 调用失败 %s" % (label, e))
+        return True
+    line = next((l for l in r.stdout.splitlines() if l.startswith("CA_JSON:")), None)
+    if r.returncode != 0 or not line:
+        tail = (r.stderr or "").strip().splitlines()
+        result["errors"].append(
+            "%s: hermes update_job fail %s" % (label, tail[-1][:160] if tail else "no output"))
+        return True
+    out = json.loads(line[len("CA_JSON:"):])
+    for c in out.get("changed", []):
+        c["home"] = label
+        c["via"] = "hermes"
+        result["changed"].append(c)
+    for s in out.get("skipped", []):
+        result["skipped"].append("%s: %s 加锁前已被移除" % (label, s))
+    return True
+
 # 第一遍:收集所有匹配,先判全局歧义,再动手写。
 selected = []  # [(label, jf, jobs, shape, hits)]
 for label, jf in homes():
@@ -214,15 +299,25 @@ if mode == "set" and not params.get("all_jobs") and not params.get("force_multi"
 # 第二遍:对 selected 里的每个 home 上锁改写。
 for label, jf, jobs, shape, hits in selected:
     cron_dir = os.path.dirname(jf)
+    home_dir = os.path.dirname(cron_dir)
     if os.path.islink(jf):
         # 仅 jobs.json 条目本身是 symlink 才拒:gateway 锁的是它所在目录的
         # .jobs.lock(未 resolve),我们把锁建到别处就不是同一把。目录级
         # symlink(~/.hermes 链到数据盘等)不影响——锁路径经同一串链接解析到
-        # 同一真实 inode。list 本来就不进这段。
+        # 同一真实 inode。list 本来就不进这段。via=hermes 也一样:update_job
+        # 会照 gateway 逻辑锁同目录的 .jobs.lock,我们这里的拒绝一致适用。
         result["errors"].append(
             "%s: jobs.json 是符号链接(→ %s),锁会落到错的位置,跳过。先固化链接再改。"
             % (label, os.path.realpath(jf)))
         continue
+    # 优先走 home 自带 Hermes 的 update_job(via=hermes):同一条锁+reload+merge+
+    # normalize+原子写路径,不受我们重实现的 map/dict schema 分支影响。没有
+    # venv(外部工具写的库、精简部署)才落到下面的 raw 写。dry-run 不走子进程
+    # (否则每个 home 一次 import,太贵),由 raw 路径出 pending。
+    if not params.get("dry_run"):
+        ids = [str(j.get("id")) for j in hits]
+        if set_via_hermes(label, home_dir, jf, ids, params["value"], False):
+            continue
     lock_path = os.path.join(cron_dir, ".jobs.lock")
     try:
         # 目录属主优先:别让锁文件被建成 root:root 而 gateway 开不了
@@ -470,6 +565,14 @@ def cmd_set(args):
         print("✗ set 需要 --job PATTERN 或 --all-jobs"); return 2
     if args.job and not all(args.job):
         print("✗ --job 不能是空串(会匹配所有作业;要全开用 --all-jobs)"); return 2
+    # --all-jobs 在 profile=None 时会扫到机器上所有 home(root、/home/*、env)。
+    # 多 home 的机器上这是跨 gateway 的全量写,要求显式确认范围:
+    #   --profile NAME 限定范围,或 --all-homes 声明"我知道会碰所有 home"。
+    # 单 home 的机器上 --all-homes 也只是多写一个 flag,不阻塞。
+    if args.all_jobs and not args.profile and not args.all_homes:
+        print("✗ --all-jobs 会覆盖该机全部 home(/root、/home/* 上所有 gateway)。")
+        print("  缩小范围:加 --profile NAME;确认全量:加 --all-homes。")
+        return 2
     params = {"value": args.on, "patterns": args.job or [],
               "all_jobs": args.all_jobs, "force_multi": args.force_multi,
               "dry_run": args.dry_run, "profile": args.profile}
@@ -520,6 +623,8 @@ def main():
     p.add_argument("--jump", help="--host 的 ProxyJump")
     p.add_argument("--job", action="append", help="job id 精确匹配或 name 子串,可重复")
     p.add_argument("--all-jobs", action="store_true", help="选中该 home 全部作业")
+    p.add_argument("--all-homes", action="store_true",
+                   help="确认 --all-jobs 要覆盖机器上所有 home(多 gateway 机必须)")
     p.add_argument("--profile", help="只动某个 profile")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--on", dest="on", action="store_true")

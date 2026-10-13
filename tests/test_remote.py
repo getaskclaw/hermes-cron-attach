@@ -239,6 +239,44 @@ def test_second_home_gets_no_fresh_35s(tmp_path):
             lf.close()
 
 
+# ---------- via=hermes (real venv) ----------
+
+REAL_VENV = "/root/.hermes/hermes-agent"
+REAL_PY = os.path.join(REAL_VENV, "venv", "bin", "python")
+
+
+@pytest.mark.skipif(not os.path.isfile(REAL_PY),
+                    reason="needs a real Hermes venv on this box")
+def test_via_hermes_runs_update_job(home, tmp_path):
+    """A home carrying its own hermes-agent/venv must be written through
+    update_job, not our raw path — proof: normalized fields appear."""
+    # fake hermes-agent dir: real venv symlink + real cron package + top modules
+    src = os.path.join(home, "hermes-agent")
+    os.makedirs(src)
+    os.symlink(os.path.join(REAL_VENV, "venv"), src + "/venv")
+    for name in ("cron", "agent", "hermes_constants.py", "utils.py"):
+        os.symlink(os.path.join(REAL_VENV, name), src + "/" + name)
+    jf = home + "/cron/jobs.json"
+    write_jobs(jf, {"jobs": [{"id": "v1", "name": "via-venv",
+                              "schedule": {"kind": "every", "every_s": 60}}]})
+    res = run("set", {**P, "profile": "default"}, home)
+    assert not res["errors"], res
+    assert res["changed"][0].get("via") == "hermes"
+    after = read_jobs(jf)["jobs"][0]
+    assert after["attach_to_session"] is True
+    # update_job normalized these; the raw writer would never add them
+    assert "updated_at" in read_jobs(jf)
+
+
+def test_raw_fallback_without_venv(home):
+    """No hermes-agent/venv → raw lock+write path still works (pre-#1 behavior)."""
+    jf = home + "/cron/jobs.json"
+    write_jobs(jf, {"jobs": [{"id": "r1"}]})
+    res = run("set", P, home)
+    assert not res["errors"]
+    assert read_jobs(jf)["jobs"][0]["attach_to_session"] is True
+
+
 # ---------- list mode ----------
 
 def test_list_reports_jobs(home):

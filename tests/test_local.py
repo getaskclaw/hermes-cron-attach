@@ -72,3 +72,37 @@ def test_boundary_ssh_timeout_ok(monkeypatch):
     monkeypatch.setattr(mod, "SSH_TIMEOUT", 30)  # budget exactly 5 → allowed
     res = mod.run_remote(NODE, "set", {"value": True})
     assert res["ok"] and abs(seen["params"]["budget_s"] - 5.0) < 0.01
+
+
+# ---------- --all-homes gate ----------
+
+def _args(**kw):
+    import argparse
+    base = dict(host="local", node=None, nodes=None, user=None, port=22,
+                key=None, jump=None, job=None, all_jobs=False, all_homes=False,
+                profile=None, on=True, dry_run=False, force_multi=False)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_all_jobs_without_scope_refused(capsys):
+    """--all-jobs with no --profile and no --all-homes would rewrite every
+    gateway's jobs.json on a multi-home box — must be refused up front."""
+    mod = load_mod()
+    rc = mod.cmd_set(_args(all_jobs=True))
+    assert rc == 2
+    assert "--all-homes" in capsys.readouterr().out
+
+
+def test_all_jobs_with_all_homes_allowed(monkeypatch):
+    mod = load_mod()
+    seen = captured_params(mod, monkeypatch)
+    rc = mod.cmd_set(_args(all_jobs=True, all_homes=True))
+    assert rc == 0 and seen["params"]["all_jobs"]
+
+
+def test_all_jobs_with_profile_allowed(monkeypatch):
+    mod = load_mod()
+    seen = captured_params(mod, monkeypatch)
+    rc = mod.cmd_set(_args(all_jobs=True, profile="work"))
+    assert rc == 0 and seen["params"]["profile"] == "work"

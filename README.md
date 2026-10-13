@@ -11,7 +11,7 @@
 
 ## 为什么需要它
 
-`hermes cron edit` 没有 `--attach` 旗标,改 `cron/jobs.json` 是唯一路径,而这个文件归活着的 gateway 管。本工具在远端 `<cron>/.jobs.lock` 上 flock(和 gateway 同一把跨进程锁)后读写,用 `mkstemp`+`os.replace` 原子替换,只动 `attach_to_session` 一个字段。
+`hermes cron edit` 没有 `--attach` 旗标;Hermes 的 `cronjob` agent 工具能改 `attach_to_session`,但那要给作业一次 agent 回合。本工具直接改 `cron/jobs.json`——首选每个 home 自带 `hermes-agent/venv` 的 `update_job`(via=hermes,和 gateway 同一条写路径),没有 venv 的库回落到远端 flock + `mkstemp`+`os.replace` 原子写。
 
 ## 一眼看懂
 
@@ -121,7 +121,8 @@ chmod +x cron_attach.py
 
 ./cron_attach.py set --host local --job "日报" --on --dry-run   # 先看不改
 ./cron_attach.py set --host local --job 68fb7aa1d644 --on
-./cron_attach.py set --host user@1.2.3.4 --all-jobs --off
+./cron_attach.py set --host user@1.2.3.4 --all-jobs --all-homes --off   # 机队级全量
+./cron_attach.py set --host local --all-jobs --profile myprofile --off  # 或收窄到单 profile
 ./cron_attach.py set --host local --job backup --on --profile myprofile
 
 ./cron_attach.py list --nodes nodes.json --node all   # 名册模式
@@ -130,8 +131,12 @@ chmod +x cron_attach.py
 
 `--job` 传精确 job id 或名字子串(大小写不敏感)。匹配多个默认拒绝并列出候选,`--force-multi` 放行。无匹配的 home 只记 `skipped`,不算错——多 profile 的机器很正常。
 
+`--all-jobs` 在无 `--profile` 时会扫到该机**所有** home(`$HERMES_HOME`、SSH 用户、`/root/.hermes`、`/home/*/.hermes` 及各自 `profiles/*`)——多 gateway 的机器上这是跨库全量写。此时必须二选一:加 `--profile NAME` 收窄,或加 `--all-homes` 显式确认。
+
 ## 安全要点
 
+- 写优先走每个 home 自带 `hermes-agent/venv` 的 `update_job`(via=hermes):同一条锁+reload+merge+normalize+原子写路径,`attach_to_session` 之外的字段由 Hermes 自己归一;报告里 `via` 字段区分 `hermes`/`raw`。
+- home 里没有 `hermes-agent/venv`(外部工具写的库、精简部署)才回落到远端 flock + 原子写;`--dry-run` 不起子进程,统一走 raw 出计划。
 - 远端拿 `<cron>/.jobs.lock` 的排他 flock 才读写,不会和 scheduler 的写交叉;`list` 只读不抢锁。
 - 写是 mkstemp + fsync + os.replace + 目录 fsync,中途崩溃留旧文件。
 - 写前先 `os.fchmod`+`os.fchown` 把原文件的 mode/owner 拷到临时文件——SSH 是 root 而 Hermes 跑在别人家目录下时,jobs.json 不会被改成 root 600 把 gateway 锁死。
