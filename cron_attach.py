@@ -63,6 +63,15 @@ LOCK_WAIT_SECONDS = 35.0
 
 mode, params = sys.argv[1], json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 
+# 全局截止时间(unix ts,由本地侧传入 = SSH_TIMEOUT - margin)。所有 home 的
+# 锁等待共用这一个 deadline,否则 N 个 home 各等 35s,总和可以越过本地
+# SSH_TIMEOUT——远端在用户已看到超时后仍然落盘。
+DEADLINE = float(params.get("deadline") or (time.time() + LOCK_WAIT_SECONDS))
+
+def lock_budget():
+    """本次等锁还剩多少秒。<=0 即不该再等。"""
+    return min(LOCK_WAIT_SECONDS, max(0.0, DEADLINE - time.time()))
+
 def homes():
     # 覆盖三种常见布局: $HERMES_HOME、SSH 用户的 ~/.hermes、以及 root 登录时
     # Hermes 实际跑在别的用户家目录(如 /home/computebox/.hermes)。
@@ -200,9 +209,11 @@ if mode == "set" and not params.get("all_jobs") and not params.get("force_multi"
 # 第二遍:对 selected 里的每个 home 上锁改写。
 for label, jf, jobs, shape, hits in selected:
     cron_dir = os.path.dirname(jf)
-    if os.path.realpath(jf) != jf:
-        # jobs.json 是符号链接:gateway 锁的是它所在目录的 .jobs.lock(未 resolve),
-        # 把锁和写都挪到真实路径会让两把锁互不相识。list 不受影响——它本来就不进这段。
+    if os.path.islink(jf):
+        # 仅 jobs.json 条目本身是 symlink 才拒:gateway 锁的是它所在目录的
+        # .jobs.lock(未 resolve),我们把锁建到别处就不是同一把。目录级
+        # symlink(~/.hermes 链到数据盘等)不影响——锁路径经同一串链接解析到
+        # 同一真实 inode。list 本来就不进这段。
         result["errors"].append(
             "%s: jobs.json 是符号链接(→ %s),锁会落到错的位置,跳过。先固化链接再改。"
             % (label, os.path.realpath(jf)))
@@ -222,10 +233,15 @@ for label, jf, jobs, shape, hits in selected:
         except OSError:
             pass
         lf = open(lock_path, "a+")
-        # LOCK_NB 轮询 + 上界(同 Hermes:它自己的锁等待也是非阻塞轮询)。阻塞式
-        # LOCK_EX 会把进程钉在不可中断的内核等待里:本地 ssh timeout 杀不掉它,
-        # 远端会继续等锁然后偷偷落盘——用户看到超时重试,旧改动却在后面才生效。
-        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        # LOCK_NB 轮询 + 上界(同 Hermes:它自己的锁等待也是非阻塞轮询)。
+        # 阻塞式 LOCK_EX 等待本身可被信号打断;真正的坑在于本地 ssh 被杀时
+        # 远端收不到任何信号会继续等锁并落盘——用户看到超时重试,旧改动才生效。
+        # 等锁预算取 min(35s, 全局 deadline 剩余):N 个 home 串行时总和仍受
+        # SSH_TIMEOUT 约束,不会拖到本地超时之后才写。
+        budget = lock_budget()
+        if budget <= 0:
+            raise TimeoutError("全局 deadline 已过,跳过(本地即将超时)")
+        deadline = time.monotonic() + budget
         while True:
             try:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -233,7 +249,7 @@ for label, jf, jobs, shape, hits in selected:
             except OSError:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        "等锁 %gs 超时(gateway 持锁中或锁泄漏)" % LOCK_WAIT_SECONDS)
+                        "等锁 %.0fs 超时(gateway 持锁中或锁泄漏)" % budget)
                 time.sleep(0.2)
     except (OSError, TimeoutError) as e:
         result["errors"].append("%s: lock fail %s" % (label, e))
@@ -373,6 +389,12 @@ def ssh_argv(node, remote_args):
 
 
 def run_remote(node, mode, params):
+    # 远端等锁的全局 deadline = SSH_TIMEOUT - margin。margin 给本地 subprocess
+    # 调用本身(ssh 建连、stdin 写 payload、stdout 回程)留量:远端在本地 kill
+    # 之前就停下,不会出现"用户看到超时、改动却晚到"。list 模式不持锁,不用给。
+    if mode == "set":
+        params = dict(params)
+        params["deadline"] = time.time() + max(5.0, SSH_TIMEOUT - 10.0)
     pb64 = base64.b64encode(json.dumps(params, ensure_ascii=False).encode()).decode()
     argv = ssh_argv(node, [mode, pb64])
     try:
