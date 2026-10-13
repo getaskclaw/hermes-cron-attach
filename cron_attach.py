@@ -184,7 +184,7 @@ result = {"ok": True, "homes": [], "changed": [], "errors": [], "skipped": [],
 # RuntimeError(非 OSError,逃出 _jobs_lock 的 except,什么都不写)。
 # BUDGET 由父进程按剩余锁预算传入,子进程不会拖到本地 ssh 已超时之后才写。
 _HERMES_SET = r"""
-import json, sys, os
+import json, sys, os, time
 agent_dir, home, ids, val, budget = sys.argv[1], sys.argv[2], \
     json.loads(sys.argv[3]), json.loads(sys.argv[4]), float(sys.argv[5])
 sys.path.insert(0, agent_dir)
@@ -201,10 +201,17 @@ if not hasattr(cj, "_acquire_flock"):
     print("CA_INCOMPAT: no _acquire_flock", file=sys.stderr)
     sys.exit(3)
 
+deadline = time.monotonic() + budget  # L7: 整个 child 共享这一个截止点
+
 _orig_acquire = cj._acquire_flock
 def _strict_flock(fd, timeout):
-    # 等锁最多 budget 秒;拿不到就抛——绝不落到 gateway 的"无锁照写"兜底。
-    if _orig_acquire(fd, min(timeout, budget)) is not True:
+    # 等锁最多 (deadline - now) 秒;拿不到就抛——绝不落到 gateway 的
+    # "无锁照写"兜底。多个 id 的 update_job 各自调锁,但预算只剩一份:
+    # 累计等待不得超过 budget。
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("cron jobs lock budget exhausted")
+    if _orig_acquire(fd, min(timeout, remaining)) is not True:
         raise RuntimeError("cron jobs lock busy (gateway 持锁或锁泄漏)")
     return True
 cj._acquire_flock = _strict_flock
@@ -213,7 +220,11 @@ out = {"ok": True, "changed": [], "skipped": [], "warnings": []}
 with use_cron_store(home):
     before = {str(j.get("id")): j.get("attach_to_session")
               for j in list_jobs()}
-    for jid in ids:
+    for i, jid in enumerate(ids):
+        if deadline - time.monotonic() <= 0:
+            out["skipped"].extend(ids[i:])
+            out["warnings"].append("budget exhausted mid-write")
+            break
         if before.get(jid) is val:
             continue  # 已是目标值:不动,也不报 changed(update_job 总会写盘)
         job = update_job(jid, {"attach_to_session": val})
@@ -298,9 +309,9 @@ def set_via_hermes(label, home_dir, jf, ids, val):
         # changed,再报超时——"超时但什么都没写"会把已落盘的改动说没了。
         # e.stdout 在 capture_output 下是 bytes(或 None),别拿 r 变量——
         # subprocess.run 抛异常时 r 根本没赋值,直接用会 UnboundLocalError。
-        raw = e.stdout if isinstance(e.stdout, bytes) else (
-            (e.stdout or "").encode("utf-8", "replace") if e.stdout else b"")
-        done_lines = [l for l in raw.decode("utf-8", "replace").splitlines()
+        out_b = e.stdout or b""
+        out_s = out_b.decode("utf-8", "replace") if isinstance(out_b, bytes) else out_b
+        done_lines = [l for l in out_s.splitlines()
                       if l.startswith("CA_DONE:")]
         for l in done_lines:
             c = json.loads(l[len("CA_DONE:"):])

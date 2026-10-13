@@ -323,28 +323,33 @@ def test_profile_home_uses_parent_venv(home):
 
 
 def test_timeout_reports_partial_writes(home):
-    """H1: a timed-out child may have already written some ids. The parent must
-    parse CA_DONE lines from the exception's stdout (bytes) and report them as
-    changed — not crash on unbound `r` or leave them unreported."""
-    src = os.path.join(home, "hermes-agent")
-    os.makedirs(src)
-    os.symlink(os.path.join(REAL_VENV, "venv"), src + "/venv")
-    for name in ("cron", "agent", "hermes_constants.py", "utils.py"):
-        os.symlink(os.path.join(REAL_VENV, name), src + "/" + name)
+    """H1+T1: a timed-out child that already emitted CA_DONE lines must have
+    them reported as changed (partial:true), not crash on unbound `r` or on
+    bytes-vs-str. Portable: the shim venv python needs no real Hermes."""
+    # venv/bin/python shim: print one CA_DONE for job 't1', then hang so the
+    # parent's subprocess timeout fires with partial stdout in the exception.
+    shim_dir = os.path.join(home, "hermes-agent", "venv", "bin")
+    os.makedirs(shim_dir)
+    shim = os.path.join(shim_dir, "python")
+    done = json.dumps({"id": "t1", "name": "t1", "old": None, "new": True})
+    with open(shim, "w") as f:
+        f.write("#!/bin/sh\n"
+                "printf 'CA_DONE:%s\\n'\n"
+                "exec sleep 30\n" % done.replace("'", "'\\''"))
+    os.chmod(shim, 0o755)
     jf = home + "/cron/jobs.json"
     write_jobs(jf, {"jobs": [{"id": "t1",
                               "schedule": {"kind": "every", "every_s": 60}}]})
-    # budget=0 → subprocess.run's timeout ≈ 15s would still fire only if the
-    # child ran; we need the timeout path. Patch the remote payload's timeout
-    # to 0 so subprocess.run raises TimeoutExpired with partial stdout.
-    remote_slow = REMOTE_SRC.replace("timeout=budget + 15", "timeout=0.001")
-    assert remote_slow != REMOTE_SRC, "timeout replace failed — pattern drifted"
-    res = run("set", {**P, "budget_s": 30}, home, remote_src=remote_slow)
-    # No crash, error reported
+    # tighten the child timeout so the test doesn't actually wait ~16s
+    remote_fast = REMOTE_SRC.replace("timeout=budget + 15", "timeout=budget + 1")
+    assert remote_fast != REMOTE_SRC, "timeout replace failed — pattern drifted"
+    res = run("set", {**P, "budget_s": 1}, home, remote_src=remote_fast)
     assert res["errors"], res
     assert "超时" in res["errors"][0]
-    # Job may or may not have been written depending on timing — but the run
-    # must not have crashed on UnboundLocalError
+    # the partial write must be surfaced, not swallowed
+    assert res["changed"], res
+    assert res["changed"][0]["id"] == "t1"
+    assert res["changed"][0]["partial"] is True
     assert all("UnboundLocalError" not in e for e in res["errors"])
 
 
