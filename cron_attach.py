@@ -52,7 +52,7 @@ NODES_PATH = os.environ.get("FLEET_NODES", "")
 SSH_TIMEOUT = int(os.environ.get("CRON_ATTACH_SSH_TIMEOUT", "90"))
 # 远端等锁预算 = SSH_TIMEOUT - margin。margin 要盖住 ssh 建连(ConnectTimeout=8,
 # 可能还有 ProxyJump 第二跳)、stdin 写 payload、远端解释器启动和 stdout 回程。
-SSH_MARGIN = 25.0
+SSH_MARGIN = 35.0
 
 # ---- 远端载荷:枚举 home → 列作业 或 在锁内改 attach_to_session ----
 # 通过 argv: python3 - <mode> <params_b64>
@@ -185,13 +185,21 @@ result = {"ok": True, "homes": [], "changed": [], "errors": [], "skipped": [],
 # BUDGET 由父进程按剩余锁预算传入,子进程不会拖到本地 ssh 已超时之后才写。
 _HERMES_SET = r"""
 import json, sys, os
-home, ids, val, budget = sys.argv[1], json.loads(sys.argv[2]), \
-    json.loads(sys.argv[3]), float(sys.argv[4])
-sys.path.insert(0, home + "/hermes-agent")
+agent_dir, home, ids, val, budget = sys.argv[1], sys.argv[2], \
+    json.loads(sys.argv[3]), json.loads(sys.argv[4]), float(sys.argv[5])
+sys.path.insert(0, agent_dir)
 os.environ["HERMES_HOME"] = home  # list_jobs 的 executions.db 按 home 定位,
                                   # 不设会摸到 root 的库
-import cron.jobs as cj
-from cron.jobs import use_cron_store, list_jobs, update_job
+try:
+    import cron.jobs as cj
+    from cron.jobs import use_cron_store, list_jobs, update_job
+except (ImportError, AttributeError) as e:
+    # 3 = Hermes API 不兼容,父进程据此回落 raw 写(别靠 stderr 文本匹配)
+    print("CA_INCOMPAT: %s" % e, file=sys.stderr)
+    sys.exit(3)
+if not hasattr(cj, "_acquire_flock"):
+    print("CA_INCOMPAT: no _acquire_flock", file=sys.stderr)
+    sys.exit(3)
 
 _orig_acquire = cj._acquire_flock
 def _strict_flock(fd, timeout):
@@ -214,22 +222,31 @@ with use_cron_store(home):
             continue
         out["changed"].append({"id": jid, "name": job.get("name"),
                                "old": before.get(jid), "new": val})
+        # 每个 id 落盘即报:父进程超时杀掉子进程时,已完成的改动不至于
+        # 被整体误报成"什么都没写"(它们实际已经落盘)。
+        print("CA_DONE:" + json.dumps(out["changed"][-1], ensure_ascii=False),
+              flush=True)
 print("CA_JSON:" + json.dumps(out, ensure_ascii=False))
 """
 
 def hermes_python(home_dir):
     """home 自带的 Hermes venv 解释器;profile home 用父 home 的 venv。
-    没有就回 None(走 raw 路径)。"""
-    for d in (home_dir, os.path.dirname(home_dir)):
+    没有就回 None(走 raw 路径)。返回 (python, agent_dir) 或 (None, None)。"""
+    # profile home 是 <home>/profiles/NAME:往上两级才是带 venv 的父 home。
+    # 非 profile 时 dirname(home_dir) 已经够用,profiles 情形要多上一层。
+    cands = [home_dir, os.path.dirname(home_dir)]
+    if os.path.basename(os.path.dirname(home_dir)) == "profiles":
+        cands.append(os.path.dirname(os.path.dirname(home_dir)))
+    for d in cands:
         py = os.path.join(d, "hermes-agent", "venv", "bin", "python")
         if os.path.isfile(py) and os.access(py, os.X_OK):
-            return py
-    return None
+            return py, os.path.join(d, "hermes-agent")
+    return None, None
 
 def set_via_hermes(label, home_dir, jf, ids, val):
     """用 home 自己的 Hermes 改 attach_to_session。返回 True 走了这条路
     (结果已挂进 result);False 回退到 raw 写。"""
-    py = hermes_python(home_dir)
+    py, agent_dir = hermes_python(home_dir)
     if not py:
         return False
     if not ids:
@@ -249,6 +266,17 @@ def set_via_hermes(label, home_dir, jf, ids, val):
     preexec = None
     if uid is not None and os.geteuid() == 0 and uid != 0:
         def _drop():
+            # initgroups 先按属主重置附属组(setgroups 会带上 root 的组),
+            # 再 setgid/setuid——顺序不能反,uid 降下来就没权限改组了。
+            try:
+                import pwd as _pwd
+                name = _pwd.getpwuid(uid).pw_name
+                os.initgroups(name, gid)
+            except Exception:
+                try:
+                    os.setgroups([])
+                except OSError:
+                    pass
             os.setgid(gid); os.setuid(uid)
         preexec = _drop
     env = dict(os.environ)
@@ -260,27 +288,36 @@ def set_via_hermes(label, home_dir, jf, ids, val):
         env["HOME"] = home_dir
     try:
         r = subprocess.run(
-            [py, "-c", _HERMES_SET, home_dir, json.dumps(sorted(ids)),
+            [py, "-c", _HERMES_SET, agent_dir, home_dir, json.dumps(sorted(ids)),
              json.dumps(val), repr(budget)],
             capture_output=True, text=True, env=env, preexec_fn=preexec,
+            cwd=home_dir,  # 别在 root 的 /root 起子进程
             timeout=budget + 15)  # budget 等锁 + ~15s 启动/导入/写盘余量
     except subprocess.TimeoutExpired:
-        result["errors"].append("%s: hermes update_job 超时" % label)
+        # 子进程可能已经把部分 id 写盘:解析 CA_DONE 行,把已落盘的改动补进
+        # changed,再报超时——"超时但什么都没写"会把已落盘的改动说没了。
+        done_lines = [l for l in (r.stdout or "").splitlines()
+                      if l.startswith("CA_DONE:")]
+        for l in done_lines:
+            c = json.loads(l[len("CA_DONE:"):])
+            c["home"] = label; c["via"] = "hermes"; c["partial"] = True
+            result["changed"].append(c)
+        result["errors"].append(
+            "%s: hermes update_job 超时(%d 个 id 已落盘,见上)" % (label, len(done_lines)))
         return True
     except Exception as e:
         result["errors"].append("%s: hermes venv 调用失败 %s" % (label, e))
         return True
     line = next((l for l in r.stdout.splitlines() if l.startswith("CA_JSON:")), None)
+    if r.returncode == 3:
+        # 子进程明确报 Hermes API 不兼容 → 回落 raw(别靠 stderr 文本匹配)
+        tail = (r.stderr or "").strip().splitlines()
+        msg = tail[-1][:160] if tail else "incompatible"
+        result["warnings"].append("%s: hermes 版本过旧(%s),回落 raw 写" % (label, msg))
+        return False
     if r.returncode != 0 or not line:
         tail = (r.stderr or "").strip().splitlines()
         msg = tail[-1][:160] if tail else "no output"
-        # 老 Hermes 没有 use_cron_store/update_job → 回落到 raw 路径
-        # (但锁超时绝不能回落——那正是我们要防的"锁占还写")。
-        if "ImportError" in msg or "cannot import name" in msg or \
-           "ModuleNotFoundError" in msg:
-            result["warnings"].append(
-                "%s: hermes 版本过旧(%s),回落 raw 写" % (label, msg))
-            return False
         result["errors"].append("%s: hermes update_job fail %s" % (label, msg))
         return True
     out = json.loads(line[len("CA_JSON:"):])
@@ -430,10 +467,16 @@ for label, jf, jobs, shape, hits in selected:
                 if isinstance(orig.get("jobs"), dict):
                     # jobs 原本是 dict:保持 schema 与原键名。load() 已给每条挂上
                     # _map_key(原 map 键);gateway 新增的作业没有 _map_key,用 id 兜底。
+                    # 原文件里非 dict 的值(注释、垃圾)原样保留——Hermes 的 auto-repair
+                    # 会丢,但我们不该替它做清理。
+                    orig_jobs = orig.get("jobs")
                     rebuilt = {}
                     for j in jobs_now:
                         k = j.pop("_map_key", None) or str(j.get("id"))
                         rebuilt[k] = j
+                    for k, v in orig_jobs.items():
+                        if not isinstance(v, dict):
+                            rebuilt[k] = v
                     orig["jobs"] = rebuilt
                 else:
                     for j in jobs_now:
@@ -524,8 +567,8 @@ def ssh_argv(node, remote_args):
 def run_remote(node, mode, params):
     # 远端等锁预算(秒)= SSH_TIMEOUT - margin。传相对秒数而不是本地 unix 时间戳:
     # 两端时钟漂移与预算无关(远端 monotonic 自减),远端时钟快不会误报、慢不会
-    # 透支。margin 盖 ssh 建连/ProxyJump/写 payload/回程;预算耗尽时远端在本地
-    # kill 前停手,不会出现"用户看到超时、改动却晚到"。list 模式不持锁,不用给。
+    # 透支。margin 盖 ssh 建连/ProxyJump/写 payload/回程,外加 via=hermes 子进程在
+    # 预算耗尽后还能跑的 ~15s(启动/导入/写盘余量)——25s 不够,35s 才罩得住。
     if mode == "set":
         budget = SSH_TIMEOUT - SSH_MARGIN
         if budget < 5.0:

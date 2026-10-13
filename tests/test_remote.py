@@ -302,6 +302,47 @@ def test_via_hermes_refuses_when_lock_held(home):
         lf.close()
 
 
+@pytest.mark.skipif(not os.path.isfile(REAL_PY),
+                    reason="needs a real Hermes venv on this box")
+def test_profile_home_uses_parent_venv(home):
+    """L1: <home>/profiles/NAME must find <home>/hermes-agent/venv (two levels
+    up), not stop at <home>/profiles/hermes-agent. Before the fix the lookup
+    ended one level short, so profiles always fell back to the raw path."""
+    src = os.path.join(home, "hermes-agent")
+    os.makedirs(src)
+    os.symlink(os.path.join(REAL_VENV, "venv"), src + "/venv")
+    for name in ("cron", "agent", "hermes_constants.py", "utils.py"):
+        os.symlink(os.path.join(REAL_VENV, name), src + "/" + name)
+    pjf = home + "/profiles/work/cron/jobs.json"
+    write_jobs(pjf, {"jobs": [{"id": "w1",
+                               "schedule": {"kind": "every", "every_s": 60}}]})
+    res = run("set", {**P, "profile": "work"}, home)
+    assert not res["errors"], res
+    assert res["changed"][0].get("via") == "hermes"
+    assert "updated_at" in read_jobs(pjf)
+
+
+def test_hermes_incompatible_falls_back_via_exit_code(home):
+    """L4: a venv python exists but can't import the Hermes API → the child
+    exits 3 and the parent falls back to the raw writer (not a stderr-text
+    match, and not an error)."""
+    # a venv whose python is the bare system python3 — cron.jobs won't import,
+    # child exits 3, parent must raw-write
+    src = os.path.join(home, "hermes-agent", "venv", "bin")
+    os.makedirs(src)
+    shim = os.path.join(src, "python")
+    with open(shim, "w") as f:
+        f.write("#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n")
+    os.chmod(shim, 0o755)
+    jf = home + "/cron/jobs.json"
+    write_jobs(jf, {"jobs": [{"id": "f1",
+                              "schedule": {"kind": "every", "every_s": 60}}]})
+    res = run("set", P, home)
+    assert res["changed"], res
+    assert any("回落" in w or "raw" in w for w in res.get("warnings", []))
+    assert read_jobs(jf)["jobs"][0]["attach_to_session"] is True
+
+
 # ---------- list mode ----------
 
 def test_list_reports_jobs(home):

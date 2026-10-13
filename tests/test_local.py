@@ -60,7 +60,7 @@ def test_tiny_ssh_timeout_refused(monkeypatch):
     """CRON_ATTACH_SSH_TIMEOUT too small to fit margin+5s → refuse locally with
     an actionable error instead of handing the remote a uselessly small budget."""
     mod = load_mod()
-    monkeypatch.setattr(mod, "SSH_TIMEOUT", 28)  # margin 25 → budget 3 < 5
+    monkeypatch.setattr(mod, "SSH_TIMEOUT", 38)  # margin 35 → budget 3 < 5
     res = mod.run_remote(NODE, "set", {"value": True})
     assert not res["ok"]
     assert "CRON_ATTACH_SSH_TIMEOUT" in res["error"]
@@ -69,7 +69,7 @@ def test_tiny_ssh_timeout_refused(monkeypatch):
 def test_boundary_ssh_timeout_ok(monkeypatch):
     mod = load_mod()
     seen = captured_params(mod, monkeypatch)
-    monkeypatch.setattr(mod, "SSH_TIMEOUT", 30)  # budget exactly 5 → allowed
+    monkeypatch.setattr(mod, "SSH_TIMEOUT", 40)  # budget exactly 5 → allowed
     res = mod.run_remote(NODE, "set", {"value": True})
     assert res["ok"] and abs(seen["params"]["budget_s"] - 5.0) < 0.01
 
