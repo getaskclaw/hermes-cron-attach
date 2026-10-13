@@ -353,6 +353,58 @@ def test_timeout_reports_partial_writes(home):
     assert all("UnboundLocalError" not in e for e in res["errors"])
 
 
+def test_nonzero_exit_reports_partial_writes(home):
+    """M1: a child that exits non-zero may still have written some ids.
+    Parse CA_DONE from stdout on the error path too, not only on timeout."""
+    shim_dir = os.path.join(home, "hermes-agent", "venv", "bin")
+    os.makedirs(shim_dir)
+    shim = os.path.join(shim_dir, "python")
+    done = json.dumps({"id": "a", "name": "a", "old": None, "new": True})
+    with open(shim, "w") as f:
+        f.write("#!/bin/sh\n"
+                "printf 'CA_DONE:%s\\n'\n"
+                "echo 'RuntimeError: cron jobs lock budget exhausted' >&2\n"
+                "exit 1\n" % done.replace("'", "'\\''"))
+    os.chmod(shim, 0o755)
+    jf = home + "/cron/jobs.json"
+    write_jobs(jf, {"jobs": [{"id": "a",
+                              "schedule": {"kind": "every", "every_s": 60}}]})
+    res = run("set", {**P, "budget_s": 30}, home)
+    assert res["errors"], res
+    assert "fail" in res["errors"][0] or "锁预算" in res["errors"][0]
+    # the partial write must be surfaced
+    assert res["changed"], res
+    assert res["changed"][0]["id"] == "a"
+    assert res["changed"][0]["partial"] is True
+
+
+def test_child_unwritten_and_warnings_propagate(home):
+    """L8: child-side unwritten ids (budget exhausted) and warnings must reach
+    the parent's result — not be rendered as 'removed' or dropped."""
+    shim_dir = os.path.join(home, "hermes-agent", "venv", "bin")
+    os.makedirs(shim_dir)
+    shim = os.path.join(shim_dir, "python")
+    payload = json.dumps({
+        "ok": True, "changed": [],
+        "skipped": [], "unwritten": ["b"],
+        "warnings": ["budget exhausted mid-write"]})
+    with open(shim, "w") as f:
+        f.write("#!/bin/sh\n"
+                "printf 'CA_JSON:%s\\n'\n"
+                "exit 0\n" % payload.replace("'", "'\\''"))
+    os.chmod(shim, 0o755)
+    jf = home + "/cron/jobs.json"
+    write_jobs(jf, {"jobs": [{"id": "a",
+                              "schedule": {"kind": "every", "every_s": 60}}]})
+    res = run("set", {**P, "budget_s": 30}, home)
+    # unwritten must surface as an error, not a "removed" skip
+    assert res["errors"], res
+    assert "未写入" in res["errors"][0] or "锁预算" in res["errors"][0]
+    assert any("budget exhausted" in w for w in res["warnings"])
+    # nothing should be marked "加锁前已被移除" for an unwritten id
+    assert all("已被移除" not in s for s in res["skipped"])
+
+
 def test_hermes_incompatible_falls_back_via_exit_code(home):
     """L4: a venv python exists but can't import the Hermes API → the child
     exits 3 and the parent falls back to the raw writer (not a stderr-text

@@ -216,18 +216,27 @@ def _strict_flock(fd, timeout):
     return True
 cj._acquire_flock = _strict_flock
 
-out = {"ok": True, "changed": [], "skipped": [], "warnings": []}
+out = {"ok": True, "changed": [], "skipped": [], "unwritten": [], "warnings": []}
 with use_cron_store(home):
     before = {str(j.get("id")): j.get("attach_to_session")
               for j in list_jobs()}
     for i, jid in enumerate(ids):
         if deadline - time.monotonic() <= 0:
-            out["skipped"].extend(ids[i:])
+            out["unwritten"] = ids[i:]
             out["warnings"].append("budget exhausted mid-write")
             break
         if before.get(jid) is val:
             continue  # 已是目标值:不动,也不报 changed(update_job 总会写盘)
-        job = update_job(jid, {"attach_to_session": val})
+        job = None
+        try:
+            job = update_job(jid, {"attach_to_session": val})
+        except RuntimeError as e:
+            # 锁预算耗尽/锁忙:_strict_flock 抛的。已写的保留,没写的记进
+            # unwritten,exit 0 带 CA_JSON——让父进程拿到部分结果,别用
+            # traceback + exit 1 把 CA_DONE 变成孤儿输出。
+            out["unwritten"] = ids[i:]
+            out["warnings"].append("update_job fail: %s" % e)
+            break
         if job is None:
             out["skipped"].append(jid)
             continue
@@ -330,6 +339,14 @@ def set_via_hermes(label, home_dir, jf, ids, val):
         msg = tail[-1][:160] if tail else "incompatible"
         result["warnings"].append("%s: hermes 版本过旧(%s),回落 raw 写" % (label, msg))
         return False
+    # 非零 exit 也可能带着 CA_DONE——L7 后子进程会主动 exit 0,但老版本
+    # /异常路径仍会 traceback + exit 1。先收 CA_DONE 再报错,别让已落盘的
+    # 改动被吞掉。
+    for l in r.stdout.splitlines():
+        if l.startswith("CA_DONE:"):
+            c = json.loads(l[len("CA_DONE:"):])
+            c["home"] = label; c["via"] = "hermes"; c["partial"] = True
+            result["changed"].append(c)
     if r.returncode != 0 or not line:
         tail = (r.stderr or "").strip().splitlines()
         msg = tail[-1][:160] if tail else "no output"
@@ -342,6 +359,10 @@ def set_via_hermes(label, home_dir, jf, ids, val):
         result["changed"].append(c)
     for s in out.get("skipped", []):
         result["skipped"].append("%s: %s 加锁前已被移除" % (label, s))
+    for u in out.get("unwritten", []):
+        result["errors"].append("%s: %s 未写入(锁预算耗尽)" % (label, u))
+    for w in out.get("warnings", []):
+        result["warnings"].append("%s: %s" % (label, w))
     return True
 
 # 第一遍:收集所有匹配,先判全局歧义,再动手写。
