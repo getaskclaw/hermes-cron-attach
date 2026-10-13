@@ -18,7 +18,9 @@ Telegram 落到独立可续聊的线程(新会话),而不是一次性广播。
   --job PATTERN   精确匹配 job id,或大小写不敏感的 name 子串。
                   若匹配多个作业则拒绝执行并列出候选(可加 --force-multi 放行)。
   --all-jobs      选中目标 home 的全部作业。
-  --profile NAME  只动某个 profile(default = 默认 home;省略则全部 home)。
+  --profile NAME  只动某个 profile。NAME='default' 匹每个 Hermes 实例的默认
+                  home(即不带 |profile: 的那个);省略则全部 home。注意这是
+                  per-instance 筛选:每个用户的默认 home 都会被选中。
   --dry-run       只打印将要改什么,不落盘。
 
 目标指定(二选一):
@@ -53,7 +55,11 @@ SSH_TIMEOUT = int(os.environ.get("CRON_ATTACH_SSH_TIMEOUT", "90"))
 # 通过 argv: python3 - <mode> <params_b64>
 # (params 走 base64:command_argv 路径上命令要穿过两层 shell 引号,裸 JSON 会被剥引号)
 REMOTE = r'''
-import base64, fcntl, json, os, stat, sys, glob, tempfile
+import base64, fcntl, json, os, stat, sys, glob, tempfile, time
+
+# 拿锁上界(秒)。Hermes 自身是 30s(cron/jobs.py::_JOBS_LOCK_TIMEOUT_SECONDS),多等 5s
+# 是为了在本进程排队于 gateway 的 30s 临界区之后仍有机会拿到锁。
+LOCK_WAIT_SECONDS = 35.0
 
 mode, params = sys.argv[1], json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 
@@ -100,7 +106,16 @@ def load(jf):
         if isinstance(j, list):
             return j, "dict"
         if isinstance(j, dict):
-            return list(j.values()), "dict"
+            # 外部工具写的 id-keyed map:值里可能没有 "id" 字段。用 map 的键补上,
+            # 否则写回时全挤进 "None" 键,只剩最后一个作业(同 Hermes jobs.py 的
+            # 拍平逻辑:{**v, "id": v.get("id") or k})。给每条挂 _map_key 记录原键,
+            # 写回时按原键重建,避免把外部工具的键名改写成 id 值。
+            fixed = []
+            for k, v in j.items():
+                if not isinstance(v, dict):
+                    continue
+                fixed.append({**v, "id": v.get("id") or k, "_map_key": k})
+            return fixed, "dict"
         return [], "dict"
     return (data if isinstance(data, list) else []), "list"
 
@@ -110,11 +125,18 @@ def match(job, pats):
     return any(p and (p == jid or p.lower() in name.lower()) for p in pats)
 
 def profile_matches(label, prof):
-    """label 形如 home:USER 或 home:USER|profile:NAME;精确匹配 profile 名。
-    给了 --profile 就只中 profile 段,不匹 home 部分(避免 'ubuntu' 匹配所有 home:ubuntu*).
+    """label 形如 home:USER 或 home:USER|profile:NAME。
+    - prof=None(未给 --profile):所有 home 都过,不筛选。
+    - prof='default':匹所有无 profile 段的 home——即每个 Hermes 实例(每个用户)
+      的默认 home。per-instance 语义,不是只匹 SSH 用户自己:在多用户的机上,
+      每个 home 的默认库都会中。Hermes profiles 不允许叫 default,不会撞车。
+    - prof='NAME':只匹 |profile:NAME 段,不匹 home 部分
+      (避免 'ubuntu' 匹配所有 home:ubuntu*)。
     """
+    if prof is None:
+        return True
     if "|profile:" not in label:
-        return False
+        return prof == "default"
     return label.rsplit("|profile:", 1)[1] == prof
 
 def preserve(src_path, tmp_fd):
@@ -141,7 +163,8 @@ result = {"ok": True, "homes": [], "changed": [], "errors": [], "skipped": [],
 # 第一遍:收集所有匹配,先判全局歧义,再动手写。
 selected = []  # [(label, jf, jobs, shape, hits)]
 for label, jf in homes():
-    if params.get("profile") and not profile_matches(label, str(params["profile"])):
+    prof = params.get("profile")
+    if not profile_matches(label, str(prof) if prof is not None else None):
         continue
     try:
         jobs, shape = load(jf)
@@ -177,11 +200,13 @@ if mode == "set" and not params.get("all_jobs") and not params.get("force_multi"
 # 第二遍:对 selected 里的每个 home 上锁改写。
 for label, jf, jobs, shape, hits in selected:
     cron_dir = os.path.dirname(jf)
-    real_jf = os.path.realpath(jf)
-    if real_jf != jf:
-        result["warnings"].append("%s: jobs.json 是符号链接,写真实路径 %s" % (label, real_jf))
-        jf = real_jf
-        cron_dir = os.path.dirname(jf)
+    if os.path.realpath(jf) != jf:
+        # jobs.json 是符号链接:gateway 锁的是它所在目录的 .jobs.lock(未 resolve),
+        # 把锁和写都挪到真实路径会让两把锁互不相识。list 不受影响——它本来就不进这段。
+        result["errors"].append(
+            "%s: jobs.json 是符号链接(→ %s),锁会落到错的位置,跳过。先固化链接再改。"
+            % (label, os.path.realpath(jf)))
+        continue
     lock_path = os.path.join(cron_dir, ".jobs.lock")
     try:
         # 目录属主优先:别让锁文件被建成 root:root 而 gateway 开不了
@@ -197,8 +222,20 @@ for label, jf, jobs, shape, hits in selected:
         except OSError:
             pass
         lf = open(lock_path, "a+")
-        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-    except OSError as e:
+        # LOCK_NB 轮询 + 上界(同 Hermes:它自己的锁等待也是非阻塞轮询)。阻塞式
+        # LOCK_EX 会把进程钉在不可中断的内核等待里:本地 ssh timeout 杀不掉它,
+        # 远端会继续等锁然后偷偷落盘——用户看到超时重试,旧改动却在后面才生效。
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "等锁 %gs 超时(gateway 持锁中或锁泄漏)" % LOCK_WAIT_SECONDS)
+                time.sleep(0.2)
+    except (OSError, TimeoutError) as e:
         result["errors"].append("%s: lock fail %s" % (label, e))
         continue
     try:
@@ -242,9 +279,16 @@ for label, jf, jobs, shape, hits in selected:
                 orig = json.load(f)
             if isinstance(orig, dict):
                 if isinstance(orig.get("jobs"), dict):
-                    # jobs 原本是 dict:按 id 键回写,保持 schema 不变
-                    orig["jobs"] = {str(j.get("id")): j for j in jobs_now}
+                    # jobs 原本是 dict:保持 schema 与原键名。load() 已给每条挂上
+                    # _map_key(原 map 键);gateway 新增的作业没有 _map_key,用 id 兜底。
+                    rebuilt = {}
+                    for j in jobs_now:
+                        k = j.pop("_map_key", None) or str(j.get("id"))
+                        rebuilt[k] = j
+                    orig["jobs"] = rebuilt
                 else:
+                    for j in jobs_now:
+                        j.pop("_map_key", None)
                     orig["jobs"] = jobs_now
                 payload = orig
         fd, tmp = tempfile.mkstemp(dir=cron_dir, prefix=".jobs_", suffix=".tmp")
@@ -397,7 +441,7 @@ def cmd_set(args):
               "dry_run": args.dry_run, "profile": args.profile}
     res = run_remote(node, "set", params)
     if not res.get("ok"):
-        print("✗ %s: %s" % (args.node, res.get("error"))); return 1
+        print("✗ %s: %s" % (node["name"], res.get("error"))); return 1
     tag = "[dry-run] " if args.dry_run else ""
     for c in res["changed"]:
         print("%s%s %s: %s → %s  (%s)" % (
