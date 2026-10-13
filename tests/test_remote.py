@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -410,6 +411,66 @@ def test_child_unwritten_and_warnings_propagate(home):
     assert any("budget exhausted" in w for w in res["warnings"])
     # nothing should be marked "加锁前已被移除" for an unwritten id
     assert all("已被移除" not in s for s in res["skipped"])
+
+
+@pytest.mark.skipif(not os.path.isfile(REAL_PY),
+                    reason="needs a real Hermes venv on this box")
+def test_concurrent_save_jobs_no_lost_jobs(home):
+    """Plan step 4: 50 `set` runs racing a background thread that hammers
+    Hermes' own save_jobs on the same store. Assert no run errors out and
+    no job is lost from the file."""
+    src = os.path.join(home, "hermes-agent")
+    os.makedirs(src)
+    os.symlink(os.path.join(REAL_VENV, "venv"), src + "/venv")
+    for name in ("cron", "agent", "hermes_constants.py", "utils.py"):
+        os.symlink(os.path.join(REAL_VENV, name), src + "/" + name)
+    jf = home + "/cron/jobs.json"
+    write_jobs(jf, {"jobs": [
+        {"id": "j%d" % i, "schedule": {"kind": "every", "every_s": 60}}
+        for i in range(4)]})
+
+    churn_errors = []
+    churn_done = threading.Event()
+
+    def churn():
+        # real Hermes save_jobs from its own venv, hammering the same file
+        script = (
+            "import sys, os, time\n"
+            "sys.path.insert(0, %r)\n"
+            "os.environ['HERMES_HOME'] = %r\n"
+            "import cron.jobs as cj\n"
+            "t0 = time.time()\n"
+            "while time.time() - t0 < 30:\n"
+            "    try: cj.save_jobs(cj.load_jobs())\n"
+            "    except Exception as e: print('SAVEERR', e)\n"
+            "    time.sleep(0.05)\n"
+        ) % (REAL_VENV, home)
+        r = subprocess.run(
+            [os.path.join(REAL_VENV, "venv", "bin", "python"), "-c", script],
+            capture_output=True, text=True, timeout=60)
+        churn_errors.extend(l for l in r.stdout.splitlines()
+                            if l.startswith("SAVEERR"))
+        churn_done.set()
+
+    t = threading.Thread(target=churn, daemon=True)
+    t.start()
+    time.sleep(0.3)  # let the churn get going before the first set
+
+    errs = []
+    for i in range(50):
+        res = run("set", {**P, "value": (i % 2 == 0)}, home)
+        if res["errors"]:
+            errs.append((i, res["errors"]))
+
+    churn_done.wait(timeout=45)
+    t.join(timeout=10)
+
+    final = read_jobs(jf)
+    job_ids = {j.get("id") for j in final.get("jobs", [])}
+    assert job_ids == {"j0", "j1", "j2", "j3"}, \
+        "jobs lost during concurrent writes: %s" % (job_ids,)
+    assert not churn_errors, "background save_jobs errored: %s" % churn_errors[:3]
+    assert not errs, "set runs errored: %s" % errs[:3]
 
 
 def test_hermes_incompatible_falls_back_via_exit_code(home):
