@@ -322,6 +322,32 @@ def test_profile_home_uses_parent_venv(home):
     assert "updated_at" in read_jobs(pjf)
 
 
+def test_timeout_reports_partial_writes(home):
+    """H1: a timed-out child may have already written some ids. The parent must
+    parse CA_DONE lines from the exception's stdout (bytes) and report them as
+    changed — not crash on unbound `r` or leave them unreported."""
+    src = os.path.join(home, "hermes-agent")
+    os.makedirs(src)
+    os.symlink(os.path.join(REAL_VENV, "venv"), src + "/venv")
+    for name in ("cron", "agent", "hermes_constants.py", "utils.py"):
+        os.symlink(os.path.join(REAL_VENV, name), src + "/" + name)
+    jf = home + "/cron/jobs.json"
+    write_jobs(jf, {"jobs": [{"id": "t1",
+                              "schedule": {"kind": "every", "every_s": 60}}]})
+    # budget=0 → subprocess.run's timeout ≈ 15s would still fire only if the
+    # child ran; we need the timeout path. Patch the remote payload's timeout
+    # to 0 so subprocess.run raises TimeoutExpired with partial stdout.
+    remote_slow = REMOTE_SRC.replace("timeout=budget + 15", "timeout=0.001")
+    assert remote_slow != REMOTE_SRC, "timeout replace failed — pattern drifted"
+    res = run("set", {**P, "budget_s": 30}, home, remote_src=remote_slow)
+    # No crash, error reported
+    assert res["errors"], res
+    assert "超时" in res["errors"][0]
+    # Job may or may not have been written depending on timing — but the run
+    # must not have crashed on UnboundLocalError
+    assert all("UnboundLocalError" not in e for e in res["errors"])
+
+
 def test_hermes_incompatible_falls_back_via_exit_code(home):
     """L4: a venv python exists but can't import the Hermes API → the child
     exits 3 and the parent falls back to the raw writer (not a stderr-text

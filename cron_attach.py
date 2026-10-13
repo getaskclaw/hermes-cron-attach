@@ -293,10 +293,14 @@ def set_via_hermes(label, home_dir, jf, ids, val):
             capture_output=True, text=True, env=env, preexec_fn=preexec,
             cwd=home_dir,  # 别在 root 的 /root 起子进程
             timeout=budget + 15)  # budget 等锁 + ~15s 启动/导入/写盘余量
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         # 子进程可能已经把部分 id 写盘:解析 CA_DONE 行,把已落盘的改动补进
         # changed,再报超时——"超时但什么都没写"会把已落盘的改动说没了。
-        done_lines = [l for l in (r.stdout or "").splitlines()
+        # e.stdout 在 capture_output 下是 bytes(或 None),别拿 r 变量——
+        # subprocess.run 抛异常时 r 根本没赋值,直接用会 UnboundLocalError。
+        raw = e.stdout if isinstance(e.stdout, bytes) else (
+            (e.stdout or "").encode("utf-8", "replace") if e.stdout else b"")
+        done_lines = [l for l in raw.decode("utf-8", "replace").splitlines()
                       if l.startswith("CA_DONE:")]
         for l in done_lines:
             c = json.loads(l[len("CA_DONE:"):])
@@ -476,7 +480,8 @@ for label, jf, jobs, shape, hits in selected:
                         rebuilt[k] = j
                     for k, v in orig_jobs.items():
                         if not isinstance(v, dict):
-                            rebuilt[k] = v
+                            # 键若跟某个 job 撞了,job 赢——非 dict 值不许覆盖作业。
+                            rebuilt.setdefault(k, v)
                     orig["jobs"] = rebuilt
                 else:
                     for j in jobs_now:
