@@ -266,6 +266,11 @@ def test_via_hermes_runs_update_job(home, tmp_path):
     assert after["attach_to_session"] is True
     # update_job normalized these; the raw writer would never add them
     assert "updated_at" in read_jobs(jf)
+    # R1 regression: a successful via=hermes write must report each change
+    # exactly once — not once via CA_DONE (partial:true) + once via CA_JSON.
+    assert len(res["changed"]) == 1
+    assert res["changed"][0]["id"] == "v1"
+    assert "partial" not in res["changed"][0]
 
 
 def test_raw_fallback_without_venv(home):
@@ -319,6 +324,8 @@ def test_profile_home_uses_parent_venv(home):
     res = run("set", {**P, "profile": "work"}, home)
     assert not res["errors"], res
     assert res["changed"][0].get("via") == "hermes"
+    assert len(res["changed"]) == 1  # R1: no double report
+    assert "partial" not in res["changed"][0]
     assert "updated_at" in read_jobs(pjf)
 
 

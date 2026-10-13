@@ -222,7 +222,8 @@ with use_cron_store(home):
               for j in list_jobs()}
     for i, jid in enumerate(ids):
         if deadline - time.monotonic() <= 0:
-            out["unwritten"] = ids[i:]
+            out["unwritten"] = [j for j in ids[i:]
+                                if before.get(j) is not val]
             out["warnings"].append("budget exhausted mid-write")
             break
         if before.get(jid) is val:
@@ -234,7 +235,8 @@ with use_cron_store(home):
             # 锁预算耗尽/锁忙:_strict_flock 抛的。已写的保留,没写的记进
             # unwritten,exit 0 带 CA_JSON——让父进程拿到部分结果,别用
             # traceback + exit 1 把 CA_DONE 变成孤儿输出。
-            out["unwritten"] = ids[i:]
+            out["unwritten"] = [j for j in ids[i:]
+                                if before.get(j) is not val]
             out["warnings"].append("update_job fail: %s" % e)
             break
         if job is None:
@@ -262,6 +264,17 @@ def hermes_python(home_dir):
         if os.path.isfile(py) and os.access(py, os.X_OK):
             return py, os.path.join(d, "hermes-agent")
     return None, None
+
+def _collect_done(stdout_s, label, result):
+    """从子进程 stdout 里捞 CA_DONE 行补进 result['changed'](partial:true)。
+    只该在失败路径调——成功路径的 CA_JSON 已带完整 changed 列表,再收
+    CA_DONE 会双报。"""
+    for l in (stdout_s or "").splitlines():
+        if l.startswith("CA_DONE:"):
+            c = json.loads(l[len("CA_DONE:"):])
+            c["home"] = label; c["via"] = "hermes"; c["partial"] = True
+            result["changed"].append(c)
+
 
 def set_via_hermes(label, home_dir, jf, ids, val):
     """用 home 自己的 Hermes 改 attach_to_session。返回 True 走了这条路
@@ -320,14 +333,11 @@ def set_via_hermes(label, home_dir, jf, ids, val):
         # subprocess.run 抛异常时 r 根本没赋值,直接用会 UnboundLocalError。
         out_b = e.stdout or b""
         out_s = out_b.decode("utf-8", "replace") if isinstance(out_b, bytes) else out_b
-        done_lines = [l for l in out_s.splitlines()
-                      if l.startswith("CA_DONE:")]
-        for l in done_lines:
-            c = json.loads(l[len("CA_DONE:"):])
-            c["home"] = label; c["via"] = "hermes"; c["partial"] = True
-            result["changed"].append(c)
+        n = len(result["changed"])
+        _collect_done(out_s, label, result)
         result["errors"].append(
-            "%s: hermes update_job 超时(%d 个 id 已落盘,见上)" % (label, len(done_lines)))
+            "%s: hermes update_job 超时(%d 个 id 已落盘,见上)"
+            % (label, len(result["changed"]) - n))
         return True
     except Exception as e:
         result["errors"].append("%s: hermes venv 调用失败 %s" % (label, e))
@@ -339,15 +349,11 @@ def set_via_hermes(label, home_dir, jf, ids, val):
         msg = tail[-1][:160] if tail else "incompatible"
         result["warnings"].append("%s: hermes 版本过旧(%s),回落 raw 写" % (label, msg))
         return False
-    # 非零 exit 也可能带着 CA_DONE——L7 后子进程会主动 exit 0,但老版本
-    # /异常路径仍会 traceback + exit 1。先收 CA_DONE 再报错,别让已落盘的
-    # 改动被吞掉。
-    for l in r.stdout.splitlines():
-        if l.startswith("CA_DONE:"):
-            c = json.loads(l[len("CA_DONE:"):])
-            c["home"] = label; c["via"] = "hermes"; c["partial"] = True
-            result["changed"].append(c)
     if r.returncode != 0 or not line:
+        # 非零 exit 也可能带着 CA_DONE(老版本/异常路径 traceback + exit 1)。
+        # 先收 CA_DONE 再报错,别让已落盘的改动被吞掉。成功路径别扫——
+        # CA_JSON 的 changed 已是全量,再收 CA_DONE 会双报(R1)。
+        _collect_done(r.stdout, label, result)
         tail = (r.stderr or "").strip().splitlines()
         msg = tail[-1][:160] if tail else "no output"
         result["errors"].append("%s: hermes update_job fail %s" % (label, msg))
