@@ -1,5 +1,5 @@
 # Hermes 定时作业线程开关
-(英文名:hermes-cron-attach)
+(English: hermes-cron-attach)
 
 [English](README.en.md) · 简体中文
 
