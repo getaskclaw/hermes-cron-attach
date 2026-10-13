@@ -10,6 +10,96 @@
 
 `hermes cron edit` 没有 `--attach` 旗标,改 `cron/jobs.json` 是唯一路径,而这个文件归活着的 gateway 管。本工具在远端 `<cron>/.jobs.lock` 上 flock(和 gateway 同一把跨进程锁)后读写,用 `mkstemp`+`os.replace` 原子替换,只动 `attach_to_session` 一个字段。
 
+## 一眼看懂
+
+**开关开和关,区别是什么:**
+
+```plantuml
+@startuml
+skinparam DefaultFontColor #1f2937
+skinparam ArrowColor #5b6b8c
+skinparam ArrowFontColor #1f2937
+skinparam RectangleBackgroundColor #eef2fb
+skinparam RectangleBorderColor #5b6b8c
+skinparam RectangleFontColor #1f2937
+skinparam NoteBackgroundColor #dfe5fb
+skinparam NoteBorderColor #5b6b8c
+skinparam NoteFontColor #1f2937
+title attach_to_session 决定报告怎么到你手里
+
+start
+:cron 作业到点触发;
+if (attach_to_session?) then (on)
+  :Gateway 建一个\nTelegram 新线程;
+  :报告发进该线程;
+  note right
+    你在里面回复,
+    agent 带作业上下文接话
+  end note
+else (off / 未设)
+  :报告一次性发到\n你的普通聊天;
+  note right
+    回复不会进作业上下文,
+    纯广播
+  end note
+endif
+stop
+@enduml
+```
+
+**一次 `set` 在远端实际做了什么(为什么不会撞坏 gateway):**
+
+```plantuml
+@startuml
+skinparam DefaultFontColor #1f2937
+skinparam ArrowColor #5b6b8c
+skinparam ArrowFontColor #1f2937
+skinparam ParticipantBackgroundColor #eef2fb
+skinparam ParticipantBorderColor #5b6b8c
+skinparam ParticipantFontColor #1f2937
+skinparam DatabaseBackgroundColor #eef2fb
+skinparam DatabaseBorderColor #5b6b8c
+skinparam DatabaseFontColor #1f2937
+skinparam NoteBackgroundColor #dfe5fb
+skinparam NoteBorderColor #5b6b8c
+skinparam NoteFontColor #1f2937
+autonumber
+title cron_attach.py set —— 一次远端改旗标的全过程
+
+actor "你" as you
+participant "cron_attach.py\n(本机)" as cli
+participant "远端 python3 -" as remote
+participant "Hermes gateway\n(活着)" as gw
+database "cron/jobs.json" as jf
+
+you -> cli : set --host user@box --job 日报 --on
+cli -> remote : ssh 传入整个 payload(stdin)
+activate remote
+remote -> remote : flock(<cron>/.jobs.lock, LOCK_EX)
+note right of remote
+  和 gateway 用同一把锁:
+  它写的时候我等,我写的时候它等
+end note
+remote -> jf : 读全部作业
+remote -> remote : 只改 attach_to_session
+remote -> jf : mkstemp → fsync → os.replace
+note right of remote
+  先写临时文件再原子改名,
+  中途崩了旧文件还在
+end note
+remote -> remote : 释放锁,输出 JSON 结果
+deactivate remote
+remote --> cli : {"changed":[...]}
+cli --> you : env 68fb…: off → on (每日流量+健康日报)
+
+gw -> jf : 下个 tick 正常读
+note over gw, jf
+  gateway 只在持锁时读写;
+  我的写落在它两次临界区之间
+end note
+@enduml
+```
+
 ## 安装
 
 单文件,只用标准库。Python 3.8+。
